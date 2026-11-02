@@ -395,7 +395,8 @@ def generate_image(db, *, api_key_id: int, model: str, prompt: str,
             headers = dict(session._gateway_headers)
             release_connection(db)
             with httpx.Client(timeout=httpx.Timeout(300, connect=15),
-                              limits=proxy.HTTP_LIMITS) as client:
+                              limits=proxy.HTTP_LIMITS,
+                              trust_env=settings.UPSTREAM_TRUST_ENV) as client:
                 response = client.post(settings.BACKEND + '/v2/images/generations',
                                        headers=headers, json=body)
             try:
@@ -494,7 +495,8 @@ def submit_video(db, *, api_key_id: int, model: str, prompt: str, seconds=None,
             headers = dict(session._gateway_headers)
             release_connection(db)
             with httpx.Client(timeout=httpx.Timeout(90, connect=15),
-                              limits=proxy.HTTP_LIMITS) as client:
+                              limits=proxy.HTTP_LIMITS,
+                              trust_env=settings.UPSTREAM_TRUST_ENV) as client:
                 response = client.post(settings.BACKEND + '/v2/videos/generations',
                                        headers=headers, json=outgoing)
             try:
@@ -547,7 +549,8 @@ def poll_video(db, *, upstream_id: str, account_id: int) -> dict:
         headers = dict(session._gateway_headers)
         release_connection(db)
         with httpx.Client(timeout=httpx.Timeout(45, connect=15),
-                          limits=proxy.HTTP_LIMITS) as client:
+                          limits=proxy.HTTP_LIMITS,
+                          trust_env=settings.UPSTREAM_TRUST_ENV) as client:
             response = client.post(settings.BACKEND + '/v2/videos/tasks',
                                    headers=headers, json={'task_id': upstream_id})
         try:

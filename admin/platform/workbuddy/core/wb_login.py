@@ -72,6 +72,8 @@ from typing import Any
 
 import httpx
 
+from admin.config import settings
+
 _logger = logging.getLogger("admin.wb_login")
 
 # ---------------------------------------------------------------------------
@@ -504,6 +506,7 @@ def _new_session() -> PhoneLoginSession:
     client = httpx.Client(
         headers={"User-Agent": WEB_UA, "Accept-Language": "zh-CN,zh;q=0.9"},
         follow_redirects=False,
+        trust_env=settings.UPSTREAM_TRUST_ENV,
         # 分级超时：连接 5s / 读 10s / 写 10s / 池等待 5s。
         # 池等待也设上限 —— 否则连接池被占满时请求会**无限等**，
         # 那比直接失败更糟（线程一直挂着）。
@@ -1183,7 +1186,8 @@ def fetch_credential_by_state(state: str) -> dict | None:
         with httpx.Client(
                 headers={"User-Agent": WEB_UA},
                 timeout=httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT,
-                                      pool=HTTP_CONNECT_TIMEOUT)) as c:
+                                      pool=HTTP_CONNECT_TIMEOUT),
+                trust_env=settings.UPSTREAM_TRUST_ENV) as c:
             r = c.get(f"{HOST}/v2/plugin/auth/token", params={"state": state},
                       headers={"Accept": "application/json, text/plain, */*",
                                "X-No-Authorization": "true"})
@@ -1221,7 +1225,8 @@ def build_credential_from_token(token: dict) -> tuple[str, dict]:
     try:
         with httpx.Client(headers={"User-Agent": WEB_UA},
                           timeout=httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT,
-                                                pool=HTTP_CONNECT_TIMEOUT)) as c:
+                                                pool=HTTP_CONNECT_TIMEOUT),
+                          trust_env=settings.UPSTREAM_TRUST_ENV) as c:
             r = c.get(
                 f"{HOST}/v2/plugin/accounts",
                 headers={"Accept": "application/json, text/plain, */*",

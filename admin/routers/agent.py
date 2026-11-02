@@ -469,7 +469,8 @@ async def _stream_chat(db, key: ApiKey, body: dict, on_delta=None) -> dict:
             chunks: list[str] = []
             total = 0
             async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=20),
-                                         limits=proxy.HTTP_LIMITS) as client:
+                                         limits=proxy.HTTP_LIMITS,
+                                         trust_env=proxy.settings.UPSTREAM_TRUST_ENV) as client:
                 async with client.stream('POST', proxy.settings.BACKEND + '/v2/chat/completions',
                                          headers=session._gateway_headers,
                                          json=outbound) as response:

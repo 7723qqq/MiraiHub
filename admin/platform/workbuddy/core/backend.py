@@ -25,6 +25,7 @@ if _ROOT not in sys.path:
 
 from wb_install import WB  # noqa: E402  安装位置 / 版本号 / 风控配置自动发现
 from admin import client_profile as cprofile  # noqa: E402  客户端参数档案（可后台配置/同步）
+from admin.config import settings
 
 # ---------------------------------------------------------------------------
 # Ardot 画布（create_canvas）—— 真实 id 的解析口径
@@ -224,7 +225,8 @@ class AccountSession:
     def http_client(self, timeout=15):
         """Reuse TLS connections throughout one account's task run."""
         if self._http is None:
-            self._http = httpx.Client(timeout=timeout, limits=HTTP_LIMITS)
+            self._http = httpx.Client(timeout=timeout, limits=HTTP_LIMITS,
+                                      trust_env=settings.UPSTREAM_TRUST_ENV)
         self._http.timeout = httpx.Timeout(timeout)
         yield self._http
 
@@ -260,7 +262,7 @@ class AccountSession:
         # The gateway cannot prove that the desktop-only profile headers belong
         # to this server process, so leave this optional header set empty.
         extra = {}
-        with httpx.Client(timeout=5) as client:
+        with httpx.Client(timeout=5, trust_env=settings.UPSTREAM_TRUST_ENV) as client:
             headers = self.get_headers(extra)
             response = self.cm._request_with_refresh(
                 client, "POST", f"{BACKEND}/v2/chat/busy", headers,

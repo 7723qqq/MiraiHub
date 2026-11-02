@@ -132,6 +132,15 @@ class Settings:
     # 所以默认一律不发；仅当运维显式配置头名时才发送该头。
     UPSTREAM_CLIENT_HEADER = os.getenv("ADMIN_UPSTREAM_CLIENT_HEADER", "")
 
+    #: 上游请求是否继承本机系统代理（HTTP_PROXY / HTTPS_PROXY / Windows 注册表代理）。
+    #:
+    #: 默认**不继承**。本机开着第三方加速器（如 Steam++）时，它会做 TLS 中间人
+    #: 并换发自签根证书；httpx 一旦继承系统代理，所有上游调用都会
+    #: CERTIFICATE_VERIFY_FAILED —— 表现为账号刷新/模型同步全部失败、
+    #: 桌面端报「本地服务启动超时」。确实需要经代理出网时才置
+    #: ADMIN_UPSTREAM_TRUST_ENV=1。
+    UPSTREAM_TRUST_ENV = os.getenv("ADMIN_UPSTREAM_TRUST_ENV", "0") == "1"
+
     # 上游请求用量「client」列显示的产品名。
     # 腾讯 CodeBuddy/WorkBuddy 后端通过 X-IDE-Name 头识别客户端，默认 "WorkBuddy"。
     UPSTREAM_CLIENT_NAME = os.getenv("ADMIN_UPSTREAM_CLIENT_NAME", "WorkBuddy")

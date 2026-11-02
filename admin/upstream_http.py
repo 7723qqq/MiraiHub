@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import certifi
 import httpx
 from admin import request_metrics, upstream_dispatch
+from admin.config import settings
 
 _ssl_context = None
 _ssl_lock = threading.Lock()
@@ -51,7 +52,13 @@ def ssl_context():
     global _ssl_context
     with _ssl_lock:
         if _ssl_context is None:
-            _ssl_context = ssl.create_default_context(cafile=certifi.where())
+            # 信任库 = 系统证书库 + certifi：
+            #   * 系统证书库覆盖本机第三方代理（如 Steam++ 加速器）自动装进去的根证书，
+            #     它每次升级会重签自己的 CA，静态信任包会在下一次更新后失效；
+            #   * certifi 保证不把「能不能连通上游」押在操作系统的根证书集合上。
+            ctx = ssl.create_default_context()
+            ctx.load_verify_locations(cafile=certifi.where())
+            _ssl_context = ctx
         return _ssl_context
 
 
@@ -195,7 +202,8 @@ async def client(request, timeout, limits, *, retry_budget=None):
     # Direct route tests can create a Request without an application in scope.
     app = request.scope.get('app') if hasattr(request, 'scope') else getattr(request, 'app', None)
     transport = getattr(getattr(app, 'state', None), 'upstream_transport', None)
-    kwargs = {'timeout': timeout, 'limits': limits}
+    kwargs = {'timeout': timeout, 'limits': limits,
+              'trust_env': settings.UPSTREAM_TRUST_ENV}
     scope = getattr(request, 'scope', {})
     recovery = scope.setdefault('_upstream_recovery', {'used': False})
     owned = transport is None

@@ -35,6 +35,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
+from admin.config import settings
 from admin.upstream_errors import UpstreamError
 
 import upstream_compat
@@ -315,7 +316,7 @@ class CredentialManager:
         headers["X-Auth-Refresh-Source"] = "plugin"
         url = f"{BACKEND}/v2/plugin/auth/token/refresh"
         try:
-            with httpx.Client(timeout=15, limits=_HTTP_LIMITS) as c:
+            with httpx.Client(timeout=15, limits=_HTTP_LIMITS, trust_env=settings.UPSTREAM_TRUST_ENV) as c:
                 r = c.post(url, headers=headers, json={})
             data = r.json()
         except Exception as e:
@@ -483,7 +484,7 @@ class CredentialManager:
     def _request_backend(self, method: str, path: str, json_body: dict | None = None) -> dict:
         """向后端发一个同步请求，返回 {code, msg, requestId, data} 或抛异常。"""
         url = f"{BACKEND}{path}"
-        client_options = {}
+        client_options = {'trust_env': settings.UPSTREAM_TRUST_ENV}
         request_options = {}
         timeout = 15
         if os.getenv("WORKBUDDY_ANDROID") == "1":
@@ -524,7 +525,7 @@ class CredentialManager:
         headers = self.get_headers()
         url = f"{BACKEND}{path}"
         try:
-            with httpx.Client(timeout=15, limits=_HTTP_LIMITS) as c:
+            with httpx.Client(timeout=15, limits=_HTTP_LIMITS, trust_env=settings.UPSTREAM_TRUST_ENV) as c:
                 r = self._request_with_refresh(
                     c, method, url, headers, json_body=json_body)
         except Exception as e:
@@ -622,7 +623,7 @@ class CredentialManager:
         headers = self.get_headers()
         url = f"{BACKEND}/v2/images/generations"
         try:
-            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS) as c:
+            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS, trust_env=settings.UPSTREAM_TRUST_ENV) as c:
                 r = self._request_with_refresh(
                     c, "POST", url, headers, json_body=body)
         except Exception as e:
@@ -1125,7 +1126,8 @@ async def chat_completions(request: Request,
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     try:
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
+                                    trust_env=settings.UPSTREAM_TRUST_ENV) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
@@ -1333,7 +1335,8 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
         # 原来是 timeout=None（完全不设限）：连接一旦静默死掉就永久挂住，
         # 既不报错也不归还资源。改成静默超时 —— 有数据就续期、静默到上限才判死，
         # 等价于参考实现 internal/upstream/idle.go 的空闲监控，且不设总时长。
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
+                                    trust_env=settings.UPSTREAM_TRUST_ENV) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -1409,7 +1412,8 @@ async def _post_backend_once(url: str, headers: dict, body: dict) -> tuple[int, 
     # 这也是在消费一个 SSE 流（只是聚合成一次性字节），所以用同一套超时：
     # connect 短、read 管静默、**不设总时长**。原来的 timeout=120 会把 connect
     # 也设成 120s，遇到连不上的节点就一直挂着不换号。
-    async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
+    async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
+                                trust_env=settings.UPSTREAM_TRUST_ENV) as c:
         async with c.stream("POST", url, headers=headers, json=body) as r:
             chunks: list[bytes] = []
             async for chunk in r.aiter_bytes():
@@ -1637,7 +1641,8 @@ async def create_message(request: Request,
 
     # 非流式：聚合后端 SSE → 组装单个 Anthropic Message 对象
     try:
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
+                                    trust_env=settings.UPSTREAM_TRUST_ENV) as c:
             async with c.stream("POST", url, headers=headers, json=chat_body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
@@ -1707,7 +1712,8 @@ async def _stream_anthropic(url: str, headers: dict, body: dict,
         # 原来是 timeout=None（完全不设限）：连接一旦静默死掉就永久挂住，
         # 既不报错也不归还资源。改成静默超时 —— 有数据就续期、静默到上限才判死，
         # 等价于参考实现 internal/upstream/idle.go 的空闲监控，且不设总时长。
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
+                                    trust_env=settings.UPSTREAM_TRUST_ENV) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
