@@ -571,6 +571,11 @@ class DesktopAPI:
             if self.closing.is_set():
                 self.stop()
                 return
+            # 本机回环探针必须绕开系统代理：第三方加速器（如 Steam++）会把
+            # 127.0.0.1 的请求一并转出去，而代理连不到本机回环 → 连接被拒，
+            # 表现为一停在「正在启动本地服务…」直到超时。安卓端早就是这么做
+            # 的（android/python/android_runtime.py），桌面端补上同一处理。
+            probe_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             deadline = time.monotonic() + 90
             while not self.closing.is_set() and time.monotonic() < deadline:
                 if self.process.poll() is not None:
@@ -578,7 +583,7 @@ class DesktopAPI:
                 try:
                     request = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/app/desktop-ready",
                                                       headers={"X-Desktop-Boot": nonce})
-                    with urllib.request.urlopen(request, timeout=1) as response:
+                    with probe_opener.open(request, timeout=1) as response:
                         if not json.load(response).get("ready"):
                             continue
                     save_port(self.base, self.config, self.port)

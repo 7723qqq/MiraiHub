@@ -138,7 +138,11 @@ def get_device_token(force: bool = False) -> str | None:
     try:
         out = subprocess.run(
             [node, str(_HELPER)],
-            capture_output=True, text=True, timeout=_RUN_TIMEOUT, env=env,
+            # 显式按 UTF-8 解码：中文 Windows 的 locale 是 GBK，而 Node 写管道
+            # 用的是 UTF-8，直接 text=True 会让读取线程撞出 UnicodeDecodeError
+            # 并崩掉（日志里那个 'gbk' codec can't decode byte 0xaa）。
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_RUN_TIMEOUT, env=env,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except Exception:
