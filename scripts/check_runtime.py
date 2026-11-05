@@ -38,18 +38,11 @@ def main():
             with TestClient(app) as client:
                 assert client.get('/api/app/version').status_code == 200
                 assert client.get('/admin').status_code == 200
-                # join 门禁：没有访问票据时 /static/join.html 一律 404（上游
-                # join_gate 的 fail-closed 语义）；带票据才放行注册页。
+                # 2026-11-05 安全加固：join 总闸默认关闭，公开注册页一律 404；
+                # 只有票据引导页 /j 可达（短码放在 #k= 片段里，不进服务端）。
                 assert client.get('/static/join.html').status_code == 404
-                from admin import join_gate
-                from admin.db import SessionLocal
-                with SessionLocal() as gate_db:
-                    join_gate.toggle(gate_db, True, operator='runtime-check', ip='127.0.0.1')
-                    gate_code = join_gate.issue_tickets(gate_db, 1, operator='runtime-check')[0]
-                    gate_cookie = join_gate.exchange(gate_db, gate_code)
-                assert gate_cookie
-                assert client.get('/static/join.html',
-                                  cookies={join_gate.COOKIE_NAME: gate_cookie}).status_code == 200
+                assert client.get('/join').status_code == 404
+                assert client.get('/j').status_code == 200
                 assert client.post('/v1/audio/transcriptions').status_code == 401
                 from zoneinfo import ZoneInfo
                 assert str(ZoneInfo('Asia/Shanghai')) == 'Asia/Shanghai'
