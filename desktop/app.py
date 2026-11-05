@@ -248,6 +248,13 @@ def parent_watchdog():
 def backend(port: int):
     base = data_dir()
     configure_environment(base)
+    # 标记本进程是**打包客户端自带的后端**。
+    #
+    # GUI 模式由父进程 spawn 子进程时把 WB_DESKTOP_BOOT 传进来；独立
+    # `--backend <port>` 启动时没有父进程，这里自己补一个 —— 否则
+    # admin/env_guard 的启动断言会把「客户端按设计监听 0.0.0.0 + 免密标志」
+    # 当成服务端误配置拦死，独立启动的后端根本起不来。
+    os.environ.setdefault("WB_DESKTOP_BOOT", secrets.token_urlsafe(32))
     setup_logging(base)
     threading.Thread(target=parent_watchdog, daemon=True).start()
     import uvicorn
