@@ -108,6 +108,17 @@ def local_runtime() -> bool:
     return _env_flag("WORKBUDDY_DESKTOP") or _env_flag("WORKBUDDY_ANDROID")
 
 
+#: 打包客户端启动自己的本地后端时写入的握手 nonce。
+#: 只有桌面 EXE（desktop/app.py）与安卓 App（android/python/android_runtime.py）
+#: 会写它 —— 服务端部署（main.py / Docker / 宝塔）不会。
+_CLIENT_BOOT_ENV = "WB_DESKTOP_BOOT"
+
+
+def _client_backend() -> bool:
+    """本进程是否由打包客户端自己拉起（桌面 EXE / 安卓 App 的本地后端）。"""
+    return bool((os.getenv(_CLIENT_BOOT_ENV) or "").strip())
+
+
 def fs_ops_allowed() -> bool:
     """是否允许「任意路径读写 / 目录创建 / 覆盖数据库 / 重启进程」这类运维能力。
 
@@ -151,9 +162,18 @@ def assert_boot_policy() -> None:
         # 「本机客户端免密」标志。server._console_allowed() 命中该标志时
         # 不校验任何 Cookie/JWT，等于 /admin 与 /admin/assets/* 整体裸奔
         # （事故报告 R2）。桌面 EXE 只监听回环，所以按 HOST 判断。
+        #
+        # 例外：**打包客户端自带的后端**。桌面版与安卓版按设计就监听
+        # 0.0.0.0（README：「默认监听 0.0.0.0:8790，支持本机与局域网访问」），
+        # 并带免密标志让本机自动进入工作台。客户端启动后端时写入
+        # WB_DESKTOP_BOOT 握手 nonce，服务端部署不会写这个变量 ——
+        # 靠它区分「客户端自己绑全网卡」与「服务端 .env 误带该标志」。
+        # 上游在 6ad3fe1 引入本断言时没有区分这两种形态，导致从源码重建的
+        # EXE / APK 一启动就被这条断言拦死（客户端起不来）。
         host = (os.getenv("ADMIN_HOST", "") or "").strip()
         if (host and host not in ("127.0.0.1", "::1", "localhost")
-                and (_env_flag("WORKBUDDY_DESKTOP") or _env_flag("WORKBUDDY_ANDROID"))):
+                and (_env_flag("WORKBUDDY_DESKTOP") or _env_flag("WORKBUDDY_ANDROID"))
+                and not _client_backend()):
             raise RuntimeError(
                 "启动策略校验失败：ADMIN_HOST=%s 不是回环，却设置了 "
                 "WORKBUDDY_DESKTOP/WORKBUDDY_ANDROID —— 该标志会绕过 /admin 的全部鉴权。"
