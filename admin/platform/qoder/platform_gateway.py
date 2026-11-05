@@ -52,8 +52,10 @@ class QoderAccountOps:
         self.realm = realm
 
     # ---- 列表 ----
-    def list(self, db):
-        """账号列表（**会同步 DB 余额**）。
+    def list(self, db, *, page: int | None = None, page_size: int = 50,
+             search: str = "", status: str = "", sort: str = "id_desc",
+             min_credits=None, max_credits=None):
+        """账号列表（**会同步 DB 余额**）；支持服务端分页（大号池优化）。
 
         ## 为什么要写回 DB
 
@@ -66,38 +68,80 @@ class QoderAccountOps:
         列表是高频读（每次切平台、每次刷新页面），每次全量拉上游会打爆它。
         `QUOTA_TTL`（60 秒）内直接用缓存，超出才拉。
         """
+        from admin.models import Account
+        from admin.platform.shared import (apply_account_filters,
+                                           account_order,
+                                           summarize_accounts_sql)
+
+        def _base_query():
+            q = db.query(Account).filter(Account.platform == "qoder")
+            if self.realm:
+                q = q.filter(Account.domain == self.realm)
+            return q
+
         usage_map = {}
-        rows = qoder_accounts.accounts_for(db, self.realm)
-        refreshed = False
+        query = _base_query()
+        query = apply_account_filters(
+            query, Account, search=search, status=status,
+            min_credits=min_credits, max_credits=max_credits)
+        query = account_order(query, Account, sort)
+        paginated = page is not None
+        if paginated:
+            from sqlalchemy import func as _func
+
+            total = int(query.with_entities(
+                _func.count(Account.id)).scalar() or 0)
+            rows = (query.offset((max(1, page) - 1) * page_size)
+                    .limit(page_size).all())
+        else:
+            rows = query.all()
+        stale_ids: list[int] = []
         for account in rows:
-            if qoder_accounts.quota_is_fresh(account):
-                # 新鲜期内：用 DB 快照，但也要返回给视图用
-                try:
-                    snap = json.loads(account.credits_snapshot or "{}")
-                except ValueError:
-                    snap = {}
-                usage_map[account.id] = {
-                    "userQuota": snap.get("user_quota") or {},
-                    "addOnQuota": snap.get("addon_quota") or {},
-                    "userType": snap.get("plan") or "",
-                } if isinstance(snap, dict) else {}
-                continue
+            # **一律读 DB 快照**，过期账号记下来交给后台刷。
+            #
+            # 原来这里对每个过期号同步 `client.fetch_usage()`（一次上游 HTTP，
+            # 串行）—— 和 Loomy 的 `/accounts` 是同一个病：账号一多，列表接口
+            # 就变成「等上游」。额度是展示数据，不该挡住整页渲染。
             try:
-                data = qoder_accounts.credentials_of(account)
-                usage = client.fetch_usage(qoder_accounts.token_of(data),
-                                           qoder_accounts.realm_of(account))
-                usage_map[account.id] = usage
-                # 写回 DB 列：让 /api/accounts 与概览卡片也看到新值
-                _apply_usage(account, usage)
-                refreshed = True
-            except Exception:  # noqa: BLE001 - 单账号失败不影响列表
-                usage_map[account.id] = {}
-        if refreshed:
-            db.commit()
+                snap = json.loads(account.credits_snapshot or "{}")
+            except (ValueError, TypeError):
+                snap = {}
+            usage_map[account.id] = {
+                "userQuota": snap.get("user_quota") or {},
+                "addOnQuota": snap.get("addon_quota") or {},
+                "userType": snap.get("plan") or "",
+            } if isinstance(snap, dict) else {}
+            if not qoder_accounts.quota_is_fresh(account):
+                stale_ids.append(int(account.id or 0))
+        if stale_ids:
+            from admin.platform import shared
+
+            shared.kick_background_refresh(
+                "qoder", stale_ids, self._refresh_usage, max_items=8,
+                min_gap=10.0)
 
         views = [qoder_accounts.public_view(a, usage=usage_map.get(a.id))
                  for a in rows]
-        return {"items": views, "summary": qoder_accounts.summarize(views)}
+        if not paginated:
+            return {"items": views,
+                    "summary": qoder_accounts.summarize(views)}
+        # tab 计数不吃状态筛选
+        agg_q = apply_account_filters(
+            _base_query(), Account, search=search, status="",
+            min_credits=min_credits, max_credits=max_credits)
+        return {"items": views,
+                "summary": summarize_accounts_sql(agg_q, Account),
+                "paginated": True, "total": total,
+                "page": max(1, page), "page_size": page_size}
+
+    @staticmethod
+    def _refresh_usage(session, account) -> None:
+        """后台刷新单个账号的额度快照（由 `shared.kick_background_refresh` 调用）。"""
+        data = qoder_accounts.credentials_of(account)
+        usage = client.fetch_usage(qoder_accounts.token_of(data),
+                                   qoder_accounts.realm_of(account))
+        # 写回 DB 列：让 /api/accounts 与概览卡片也看到新值
+        _apply_usage(account, usage)
 
     # ---- 扫描本机 ----
     def scan(self):
@@ -334,8 +378,8 @@ class QoderClientProbe:
         from admin.platform.qoder.core import paths as _paths
 
         return enrich(result,
-                      exe_candidates=_paths.APP_EXE_CANDIDATES,
-                      data_dirs=_paths.DATA_DIR_CANDIDATES,
+                      exe_candidates=_paths.app_exe_candidates(),
+                      data_dirs=_paths.data_dir_candidates(),
                       product=_paths.UA_PRODUCT)
 
     def schema(self) -> list[dict]:

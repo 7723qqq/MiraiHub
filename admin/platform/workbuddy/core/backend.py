@@ -25,7 +25,6 @@ if _ROOT not in sys.path:
 
 from wb_install import WB  # noqa: E402  安装位置 / 版本号 / 风控配置自动发现
 from admin import client_profile as cprofile  # noqa: E402  客户端参数档案（可后台配置/同步）
-from admin.config import settings
 
 # ---------------------------------------------------------------------------
 # Ardot 画布（create_canvas）—— 真实 id 的解析口径
@@ -217,21 +216,39 @@ def parse_auth_meta(auth_json: str) -> dict:
 class AccountSession:
     """把一个账号的 auth_json 包成可用的后端会话。"""
 
-    def __init__(self, auth_json: str):
+    def __init__(self, auth_json: str, enterprise_id: str = ""):
         self._http = None
+        #: 本次会话是否发生过 token 刷新（意味着库里那份凭证已经旧了）。
+        #: 调用方据此决定要不要 `updated_json()` 回写 —— 只读场景（列表、
+        #: 健康检查的失败分支）不该为了一个没变的凭证白跑一次 commit。
+        self._token_rotated = False
         self.cm = CredentialManager.from_json(auth_json)
+        # 库里的 enterprise_id 是权威值：凭证里缺就补上，否则企业版会被
+        # 当成个人版，积分接口拿到空结果（= 永远显示 0）。
+        self.cm.ensure_enterprise_id(enterprise_id)
 
     @contextmanager
     def http_client(self, timeout=15):
         """Reuse TLS connections throughout one account's task run."""
+        from admin.upstream_http import ssl_context, upstream_trust_env
         if self._http is None:
             self._http = httpx.Client(timeout=timeout, limits=HTTP_LIMITS,
-                                      trust_env=settings.UPSTREAM_TRUST_ENV)
+                                     verify=ssl_context(),
+                                     trust_env=upstream_trust_env())
         self._http.timeout = httpx.Timeout(timeout)
         yield self._http
 
+    @property
+    def token_rotated(self) -> bool:
+        """本会话是否刷新过令牌（凭证需要回写）。"""
+        return bool(self._token_rotated)
+
     def get_headers(self, extra: dict | None = None) -> dict:
-        return self.cm.get_headers(extra=extra)
+        before = (self.cm._session().get("auth") or {}).get("accessToken")
+        headers = self.cm.get_headers(extra=extra)
+        if (self.cm._session().get("auth") or {}).get("accessToken") != before:
+            self._token_rotated = True
+        return headers
 
     @staticmethod
     def identity_headers(purpose: str = "conversation",
@@ -262,7 +279,9 @@ class AccountSession:
         # The gateway cannot prove that the desktop-only profile headers belong
         # to this server process, so leave this optional header set empty.
         extra = {}
-        with httpx.Client(timeout=5, trust_env=settings.UPSTREAM_TRUST_ENV) as client:
+        from admin.upstream_http import ssl_context, upstream_trust_env
+        with httpx.Client(timeout=5, verify=ssl_context(),
+                         trust_env=upstream_trust_env()) as client:
             headers = self.get_headers(extra)
             response = self.cm._request_with_refresh(
                 client, "POST", f"{BACKEND}/v2/chat/busy", headers,
@@ -324,6 +343,13 @@ class AccountSession:
         改名，导致 `admin/credits.py` 按上游原名读取时**一个字段都匹配不上**，
         所有包都被判成「无到期时间 / 剩余 0」，调度依据静默失效。
         """
+        # 企业版：没有个人那三路资源包，额度是「周期总量 - 已消耗」。
+        # 这里把它伪装成单个资源包，让 normalize/summarize/调度整条链路
+        # 原样复用 —— 不给企业版另写一套到期口径。
+        if self.cm.is_enterprise():
+            usage = self.cm.fetch_enterprise_usage()
+            if usage is not None:
+                return _enterprise_packages(usage)
         from admin.billing import collect_billing
         return collect_billing(self.cm._request_backend)
 
@@ -808,6 +834,30 @@ class AccountSession:
     def _sess_auth(self) -> dict:
         return (self.cm._session() or {}).get("auth") or {}
 
+    def _bearer(self) -> str:
+        """取当前 accessToken；**本地判定已过期就先刷新一次**。
+
+        为什么需要这个而不是直接读 `_sess_auth()["accessToken"]`：
+        本文件有 5 处手动拼头（billing / web / chat / desktop / connector），
+        它们都绕过了 `cm.get_headers()` 里的过期检查与 401 重试。于是 access
+        token 一到期，这些路径（签到、成长任务、积分明细、遥测上报）就集体
+        401，而号池只看到「这个号今天失败了几次」—— 最后被当成坏号降权/禁用，
+        真正的原因（只是没刷新）反而看不见。
+
+        刷新失败不抛异常：调用方拿到旧 token 去打上游，401 会按既有逻辑
+        分类，比在这里把整条业务打挂更可控。
+        """
+        try:
+            if self.cm._is_expired():
+                self.cm.force_refresh()
+                # 刷新轮换了 refreshToken，调用方必须把新凭证写回库；
+                # 忘了写回不是立刻废号（旧值仍可重放），但会让库里的
+                # 60 天窗口停在原地不动 —— 记一笔便于排查。
+                self._token_rotated = True
+        except Exception:
+            pass
+        return self._sess_auth().get("accessToken") or ""
+
     def _sess_acct(self) -> dict:
         return (self.cm._session() or {}).get("account") or {}
 
@@ -823,7 +873,7 @@ class AccountSession:
     def _billing_headers(self) -> dict:
         """billing 域头：CLI 形状。"""
         return {
-            "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
+            "Authorization": "Bearer " + self._bearer(),
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": _desktop_ua(),
@@ -840,7 +890,7 @@ class AccountSession:
         copilot.tencent.com，发往 www.workbuddy.cn 会造成跨域不一致。
         """
         return {
-            "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
+            "Authorization": "Bearer " + self._bearer(),
             "Accept": "application/json",
             "Content-Type": "application/json",
             "x-client-platform": "web",
@@ -924,7 +974,7 @@ class AccountSession:
     def _chat_headers(self) -> dict:
         """chat 域头：市场/场景等接口用（CLI 形状，X-Domain 走账号自己的域）。"""
         return {
-            "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
+            "Authorization": "Bearer " + self._bearer(),
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": _desktop_ua(),
@@ -1176,7 +1226,7 @@ class AccountSession:
             # 长度不定）与官方任何一处 id 都对不上。
             "X-Request-ID": identity.new_id(),
             "X-User-Id": self._uid(),
-            "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
+            "Authorization": "Bearer " + self._bearer(),
         }
 
     def _desktop_fingerprint(self) -> dict:
@@ -1539,7 +1589,7 @@ class AccountSession:
     def _ardot_connector_headers(self) -> dict:
         """调 connector/oauth 接口所需的头（账号自身凭据 + 业务域）。"""
         return {
-            "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
+            "Authorization": "Bearer " + self._bearer(),
             "Accept": "application/json",
             "Content-Type": "application/json",
             "X-Domain": self._domain() or "www.workbuddy.cn",
@@ -1755,3 +1805,36 @@ def _map_checkin_status(code: int) -> str:
         1002: "not_eligible",      # 无领取资格
         1003: "event_ended",       # 活动已结束
     }.get(code, "unknown")
+
+
+def _enterprise_packages(usage: dict):
+    """把企业版周期额度包装成一个「资源包」。
+
+    字段全部用个人包同名字段（`CycleCapacitySize*/Remain*/Used*`），
+    这样 `admin.credits.resource_summary` 不需要知道企业版的存在：
+        total = limitNum
+        used  = credit
+        remain= limitNum - credit
+    到期时间用 `CycleEndTime`（= 周期重置时间），与个人包的日历年包同义。
+    """
+    from admin.billing import BillingPackages
+
+    limit = usage.get("limit")
+    unlimited = bool(usage.get("unlimited"))
+    row = {
+        "ResourceId": "enterprise-cycle",
+        "PackageCode": "ENTERPRISE_CYCLE",
+        "PackageName": "企业版 · 不限额度" if unlimited else "企业版周期额度",
+        "Status": 0,
+        "CycleCapacitySizePrecise": str(0 if limit is None else limit),
+        "CycleCapacityRemainPrecise": str(0 if unlimited else max(0.0, usage.get("remain") or 0)),
+        "CycleCapacityUsedPrecise": str(max(0.0, usage.get("used") or 0)),
+    }
+    if usage.get("reset_at"):
+        row["CycleEndTime"] = usage["reset_at"]
+    return BillingPackages([row], {
+        "complete": True,
+        "enterprise": True,
+        "unlimited": unlimited,
+        "sources": {"enterprise": {"ok": True, "complete": True, "pages": 1, "rows": 1}},
+    })

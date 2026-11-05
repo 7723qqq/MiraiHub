@@ -127,6 +127,67 @@ def _conversation_probe(sess, model: str) -> dict:
         return result
 
 
+def _platform_health(db, account: Account) -> dict | None:
+    """非默认平台的健康检查：走各自网关的 `account_ops().health()`。
+
+    之前一律用默认平台的 `backend.AccountSession` 去探，结果「扫描 /
+    健康检查」永远打默认平台上游，别的平台账号要么 404、要么被误判失效
+    （issue #2：账号池的扫描没跟平台走）。
+
+    返回 None 表示「该账号仍走默认平台原有检查逻辑」
+    （默认平台 / 未登记平台 / 网关未实现 health）。
+    """
+    from admin.platform import registry
+
+    storage = (getattr(account, "platform", "") or "").lower()
+    if not storage or storage == registry.DEFAULT_PLATFORM:
+        return None
+    spec = registry.spec_for_storage(storage)
+    if spec is None:
+        return None
+    gw = registry.load_platform_gateway(spec, spec.realm)
+    if gw is None:
+        return None
+    ops = getattr(gw, "account_ops", None)
+    if ops is None:
+        return None
+    ops = ops()
+    health = getattr(ops, "health", None)
+    if not callable(health):
+        return None
+    try:
+        res = health(db, account.id)
+    except Exception as exc:  # noqa: BLE001 - 单平台失败不影响排查
+        _logger.warning("平台 %s 健康检查失败 id=%s: %s", storage, account.id, exc)
+        return None
+    if not isinstance(res, dict):
+        return None
+    stages = res.get("stages") or {}
+    sess_stage = stages.get("session") or stages.get("balance") or {}
+    model_stage = stages.get("models") or {}
+    healthy = bool(res.get("ok"))
+    reasons = ["%s: %s" % (name, s.get("detail"))
+               for name, s in stages.items() if not s.get("ok")]
+    return {
+        "account_id": account.id,
+        "account": res.get("account") or _account_label(account),
+        "ok": healthy,
+        "healthy": healthy,
+        "status": "healthy" if healthy else "failed",
+        "restored": False,
+        "stages": {
+            "balance": {"ok": bool(sess_stage.get("ok")),
+                        "detail": sess_stage.get("detail", ""),
+                        "stage": "session"},
+            "models": {"ok": bool(model_stage.get("ok")),
+                       "detail": model_stage.get("detail", "")},
+            "conversation": {"ok": healthy,
+                             "detail": "本平台以 session+models 表征健康"},
+        },
+        "reason": ("平台级健康检查通过" if healthy else "；".join(reasons)),
+    }
+
+
 def check_account(db, account: Account) -> dict:
     """Check balance, current model catalog, and one real conversation.
 
@@ -158,7 +219,14 @@ def check_account(db, account: Account) -> dict:
             return {"account_id": account.id, "account": label, "ok": False,
                     "healthy": False, "status": "skipped", "reason": "账号当前有在途请求或维护任务"}
 
-        sess = backend.AccountSession(original)
+        # 非默认平台：走各自网关健康检查，避免用默认平台后端去探
+        # （issue #2：账号池扫描/健康检查一直打默认平台上游）。
+        plat = _platform_health(db, account)
+        if plat is not None:
+            return plat
+
+        sess = backend.AccountSession(
+            original, enterprise_id=(getattr(account, "enterprise_id", "") or ""))
         balance_value: dict = {}
 
         def fetch_balance():

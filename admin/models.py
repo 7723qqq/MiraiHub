@@ -238,6 +238,23 @@ class UsageLog(Base):
               "error_kind", "credits", "total_tokens"),
         Index("ix_usage_logs_model_credits", "model", "created_at",
               "error_kind", "credits"),
+        # **日志汇总的完全覆盖索引**（2026-11-01 新增）。
+        #
+        # `/api/logs/summary` 与 `/api/credits/usage` 都是
+        #     SELECT account_id, COUNT(*), SUM(credits), SUM(total_tokens),
+        #            SUM(prompt_tokens), SUM(completion_tokens),
+        #            SUM(cached_tokens), AVG(latency_ms), MAX(created_at)
+        #     FROM usage_logs WHERE created_at >= ? GROUP BY account_id
+        # 之前的索引只覆盖到 credits/total_tokens，`prompt/completion/cached/
+        # latency_ms` 全部要**回表**取 —— 30 天口径 22 万行逐行回表，
+        # 线上实测 logs/summary 922ms、credits/usage 566ms。
+        # 把聚合用到的列全部放进索引后（本地 42 万行实测）：
+        #     logs/summary  710ms → 172ms（4.1x）
+        #     credits/usage 680ms → 133ms（5.1x）
+        # 列顺序：account_id（分组键）→ created_at（范围）→ 其余按聚合顺序。
+        Index("ix_usage_logs_acct_cov", "account_id", "created_at",
+              "error_kind", "credits", "total_tokens", "prompt_tokens",
+              "completion_tokens", "cached_tokens", "latency_ms"),
         Index("ix_usage_logs_key_id", "api_key_id", "id"),
         Index("ix_usage_logs_model_id", "model", "id"),
     )
@@ -302,8 +319,118 @@ class BlockedIP(Base):
     ip = Column(String(64), nullable=False)
     enabled = Column(Integer, nullable=False, default=1)
     note = Column(String(255), default="")
+    # 封禁到期时间（UTC）。NULL = 永久封禁。
+    #
+    # 为什么要这个字段：自动封禁必须有兜底时效。手动封禁是人工判断，永久合理；
+    # 自动封禁基于启发式规则（请求频率、401 率），一定会有误判——
+    # 没有过期时间就意味着一次误判永久锁死一个正常客户端，而且没人记得去解。
+    # 到期后由 `is_blocked_ip()` 视为未封禁，无需额外清理任务。
+    expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class JoinInvite(Base):
+    """自助注册入口的**后台生成凭证**（邀请码）。
+
+    背景：`/join` 与 `/api/join/*` 曾是完全公开的入口，攻击者据此把带 XSS
+    载荷的自有账号塞进号池（2026-11-02 入侵）。现在入口改为 fail-closed：
+    后台一张有效凭证都没有 → 整个自助入口关闭。
+
+    安全设计：
+      * `code_hash` 存 PBKDF2 哈希，**不存明文** —— 库被拖走也换不出邀请码。
+      * `code_prefix` 只留前 8 位供后台肉眼识别（够排查，不够用）。
+      * `max_uses` 限次（0 = 不限），`expires_at` 限时间，`enabled` 可随时撤销。
+    """
+
+    __tablename__ = "join_invites"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    #: PBKDF2 哈希，明文只在生成时返回一次。
+    code_hash = Column(String(255), nullable=False, index=True)
+    #: 明文前 8 位，仅供后台识别与日志排查。
+    code_prefix = Column(String(16), nullable=False, default="")
+    #: 备注（谁用这张码、给谁的）。
+    note = Column(String(200), default="")
+    #: 最大可用次数。0 = 不限次数（不推荐）。
+    max_uses = Column(Integer, nullable=False, default=1)
+    used_count = Column(Integer, nullable=False, default=0)
+    #: 1 = 可用；0 = 已撤销。
+    enabled = Column(Integer, nullable=False, default=1)
+    #: 过期时间（UTC）。NULL = 不过期（不推荐，后台生成时会强制加上限）。
+    expires_at = Column(DateTime, nullable=True)
+    #: 生成者标识（后台账号名），便于追责与审计。
+    created_by = Column(String(120), default="")
+    #: 代次。任何一次 join 总闸 toggle 都会 +1，旧代次的邀请码立即失效。
+    #: 为什么用代次而不是逐条删：漏删一条就是一个长期后门，代次只增不减，
+    #: 天然不会残留（见 admin/join_gate.py）。
+    epoch = Column(Integer, nullable=False, default=1, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class JoinTicket(Base):
+    """join 入口的**一次性访问票据**（只存 jti，明文只出现在签发链接里）。
+
+    职责分离：
+      * 票据（本表）：只回答「能不能打开 /join 页面」，一次性、短 TTL；
+      * 邀请码（JoinInvite）：只回答「能不能完成注册」，放在 POST body / 头。
+
+    票据明文走 URL 的 `#fragment`，不随 HTTP 请求上送 —— 不进 nginx access
+    log、不进 Referer、不进浏览器历史里的完整 URL。
+    """
+
+    __tablename__ = "join_tickets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    jti = Column(String(64), nullable=False, unique=True, index=True)
+    epoch = Column(Integer, nullable=False, default=1, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    created_by = Column(String(120), default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AdminSession(Base):
+    """后台会话行：JWT 只是运输载体，**权威状态在这张表**。
+
+    为什么必须落库
+    --------------
+    纯无状态 JWT 有两个做不到的事：
+      1. **真实退出** —— JWT 签出去就收不回来，logout 只能靠前端删本地副本；
+      2. **一人一份** —— 同一个令牌可以无限复制，谁拿到谁就是管理员。
+
+    落库之后：`logout` = 置 revoked_at；换人登录 = 吊销该账号的全部旧会话；
+    Cookie 被复制到另一台机器 = 设备绑定不匹配，直接拒。
+
+    安全细节
+    --------
+    * `token_hash` 存 SHA-256 而不是明文：库被拖走也无法反推出可用令牌；
+    * `bind_hash` = SHA-256(设备标识 Cookie)，不落原始设备 ID；
+    * 每次校验都过一遍 `revoked_at IS NULL AND expires_at > now`，不依赖时钟容差。
+    """
+
+    __tablename__ = "admin_sessions"
+    __table_args__ = (
+        Index("ix_admin_sessions_subject_active", "subject", "revoked_at"),
+        Index("ix_admin_sessions_expires", "expires_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    #: 会话标识，写进 JWT 的 `sid` 声明。
+    sid = Column(String(64), nullable=False, unique=True, index=True)
+    subject = Column(String(120), nullable=False, default="")
+    #: 完整 JWT 的 SHA-256。同一条令牌只能对应一行，换 token 即换会话。
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    #: 设备绑定摘要（空串 = 未绑定，仅限 CLI/本地壳）。
+    bind_hash = Column(String(64), nullable=False, default="")
+    ip = Column(String(64), default="")
+    ua_hash = Column(String(64), default="")
+    fp = Column(String(64), default="")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_reason = Column(String(48), default="")
 
 
 class ClientIdentity(Base):

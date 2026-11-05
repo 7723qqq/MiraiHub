@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from admin.db import get_db
 from admin.models import Schedule
 from admin.scheduler import run_task, _dump_result, start_growth_plan
-from admin.security import require_admin
+from admin.security import require_admin, clean_display_name
 from admin.schedule_timing import ScheduleTiming, timing_of, next_run_at, cycle_label, display_name
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
@@ -73,6 +73,8 @@ _TASK_FALLBACK_LABEL = {
     "trae_keepalive": "会话保活",
     "qoder_keepalive": "会话保活",
     "loomy_keepalive": "会话保活",
+    "raccoon_keepalive": "会话保活（续期临期 JWT）",
+    "raccoon_expiry_sweep": "过期清扫（标记失效账号）",
 }
 TASK_LABELS = {
     "refresh_balances": "刷新平台总积分",
@@ -281,7 +283,7 @@ def patch_schedule(sid: int, body: SchedulePatch, _: bool = Depends(require_admi
         raise HTTPException(status_code=404, detail="任务不存在")
     was_enabled = bool(s.enabled)
     if body.name is not None:
-        s.name = body.name
+        s.name = clean_display_name(body.name, s.name)
     if body.task is not None:
         if body.task not in TASK_CHOICES:
             raise HTTPException(status_code=400, detail="未知任务类型")

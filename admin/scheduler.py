@@ -758,7 +758,9 @@ def run_keepalive_tokens(db, schedule=None) -> dict:
     if refreshed:
         summary += f"，其中 {refreshed} 个刷新了 token"
     if dead_ids:
-        summary += (f"，**{len(dead_ids)} 个登录态已失效**"
+        # 这里是**纯文本**摘要（直接渲染进表格单元格），不要写 markdown 星号：
+        # 前端不会解析，页面上会原样露出 `**`。
+        summary += (f"，{len(dead_ids)} 个登录态已失效"
                     f"（{'、'.join('#' + str(i) for i in dead_ids[:5])}"
                     f"{' 等' if len(dead_ids) > 5 else ''}，"
                     f"{dead_disabled} 个已自动禁用，其余待人工重登）")
@@ -814,10 +816,11 @@ def run_growth_tasks() -> dict:
                     .filter(Account.status == "active",
                             Account.platform == _platform_of(_current_schedule()))
                     .order_by(Account.id.asc()).all())
+        accounts = growth_eligible(accounts)
         ids = [a.id for a in accounts]
         if not ids:
             return {"task": "run_growth_tasks", "ok": True, "accounts": 0,
-                    "msg": "没有可用账号"}
+                    "msg": "没有可用账号（企业版账号没有成长任务）"}
 
         run_res = growth_router.run_accounts(
             ids, None, db,
@@ -935,6 +938,19 @@ def run_refresh_growth_tasks() -> dict:
     }
 
 
+def growth_eligible(accounts):
+    """过滤掉**企业版账号**。
+
+    企业版（`enterpriseId` 非空）在官方客户端里没有「签到 / 成长任务 /
+    猫猫旅行」这些活动：它们属于个人版的运营玩法。用企业号去打这些接口
+    只会拿到 1002/1003 之类的"无资格"，既浪费请求、又把结果页刷成一片红。
+
+    判据与 `converter.ClientManager.is_enterprise()` 一致：读落库的
+    `enterprise_id`，不额外发请求。
+    """
+    return [a for a in accounts if not (getattr(a, "enterprise_id", "") or "").strip()]
+
+
 def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
     """遍历活跃账号执行每日签到领取积分。
 
@@ -962,9 +978,11 @@ def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
     accounts = (db.query(Account).filter(Account.status == "active")
                 .filter(Account.platform == _platform_of(schedule))
                 .order_by(Account.id.asc()).all())
+    # 企业版没有签到活动，先剔掉再判断「有没有账号」
+    accounts = growth_eligible(accounts)
     if not accounts:
         return {"task": "daily_checkin", "ok": True, "total": 0,
-                "msg": "没有可用账号"}
+                "msg": "没有可用账号（企业版账号不参与签到）"}
 
     claimed = skipped_already = failed = 0
     total_credit = 0
@@ -1189,7 +1207,33 @@ def _run_one(s: Schedule, db, now: datetime):
         from admin.models import SystemSetting
         pending = db.get(SystemSetting, "keepalive:pending")
         if not (pending and pending.value not in ("", "[]")) and not _keepalive_due(s, now):
-            # 还没到今天的计划时刻 → 顺延到下一个计划时刻（正常等待）
+            # 还没到今天的计划时刻。**但没有直接顺延**：
+            #
+            # 续期窗口（refreshToken，60 天）是账号唯一的死亡线，而这条预设
+            # 节奏一旦在整点错过就是一整天。所以这里多做一件事：如果按兜底
+            # 周期（ADMIN_RENEWAL_SWEEP_SECONDS）该扫了，且确实有号的窗口
+            # 快见底/解析不出，就把 run_task 立刻跑一遍 —— 而不是等 22:00。
+            #
+            # 没有紧急号时一行都不打上游（`_renewal_urgent_ids` 只读凭证、
+            # 不打网络），所以这个检查本身是零成本的。
+            if _renewal_sweep_due(db, now):
+                try:
+                    urgent = _renewal_urgent_ids(db)
+                except Exception:      # noqa: BLE001 - 扫描失败不影响正常排期
+                    urgent = []
+                _mark_renewal_sweep(db, now)
+                if urgent:
+                    result = run_task(s.task, db, s)
+                    payload = dict(result)
+                    payload["summary"] = (
+                        "续期窗口兜底：" + str(result.get("summary") or "")
+                        + f"（触发账号 {'、'.join('#' + str(i) for i in urgent[:5])}"
+                        + (" 等" if len(urgent) > 5 else "") + "）")
+                    s.last_result = _dump_result(payload)
+                    s.last_run_at = now
+                    s.next_run_at = _next_keepalive_at(now)
+                    db.commit()
+                    return
             s.next_run_at = _next_keepalive_at(now)
             db.commit()
             return
@@ -1213,12 +1257,24 @@ def _run_one(s: Schedule, db, now: datetime):
     db.commit()
 
 
+#: 上次平台任务补种的时间（monotonic）。新平台接入 / 新账号导入后，
+#: 不必重启进程就能拿到定时任务 —— 导入成功路径也会立刻补一次，这里只是兜底。
+_last_platform_seed = 0.0
+
+
 def _loop():
     while True:
         db = None
         try:
             db = SessionLocal()
             now = datetime.utcnow()
+            global _last_platform_seed
+            if time.monotonic() - _last_platform_seed > 900:
+                _last_platform_seed = time.monotonic()
+                try:
+                    ensure_platform_schedules(db)
+                except Exception:  # noqa: BLE001 - 兜底失败不能停调度
+                    _logger.exception("平台定时任务兜底补种失败")
             schedules = db.query(Schedule).filter(Schedule.enabled == 1).all()
             # 先启动独立的成长巡检线程，再执行原有同步任务。旧的一次性
             # 成长任务可能很长，不能让它拖延已经到期的每日活跃巡检。
@@ -1546,8 +1602,116 @@ def _is_keepalive_hour(now: datetime) -> bool:
     return _local_now().hour in hours
 
 
+# ---------------------------------------------------------------------------
+# 续期窗口兜底（renewal sweep）
+# ---------------------------------------------------------------------------
+
+def _renewal_urgent_ids(db) -> list[int]:
+    """找出「续期窗口快要/已经见底」的账号。
+
+    判据来自各平台的 `Gateway.credential_expiry()`：续期窗口的剩余天数
+    低于该平台的告急阈值，或干脆解析不出来。
+
+    为什么这件事不能只交给每日保活：保活是**预设整点**触发，错过就是一整天
+    （历史上积压过 18 天）。而续期窗口是账号唯一的死亡线 —— 短期令牌过期
+    刷新就回来，窗口过期则真的只能重新授权登录。兜底扫描把它变成
+    「最多晚 N 秒」。
+
+    只回 idle 名单，不在这里打上游：真正的刷新由保活那把全局锁串行执行，
+    并发刷新是明显的机器特征，也可能触发上游风控。
+    """
+    from admin.credential_expiry import STATE_UNKNOWN, credential_expiry, renews_guard_days
+    from admin.models import Account
+
+    guard = renews_guard_days()
+    urgent: list[int] = []
+    # 老数据的 platform 可能是空串（历史行），`Account.platform == "workbuddy"`
+    # 会把它们漏掉。这里不再按平台过滤 —— 有没有续期窗口由各平台自己回答，
+    # 不支持的平台会返回 supported=False，直接跳过即可。
+    rows = (db.query(Account)
+            .filter(Account.status == "active")
+            .order_by(Account.id.asc()).all())
+    for acc in rows:
+        info = credential_expiry(acc)
+        if not info.get("supported"):
+            continue
+        if not info.get("has_refresh"):
+            # 没有续期令牌的号根本救不回来，别浪费一次上游请求。
+            continue
+        days = info.get("refresh_days_left")
+        if info.get("refresh_state") == STATE_UNKNOWN:
+            # 解析不出到期时间（凭证格式异常）→ 值得试一次刷新，
+            # 刷新成功会把两条时间线都写正。
+            urgent.append(acc.id)
+        elif days is not None and days < guard:
+            urgent.append(acc.id)
+    return urgent
+
+
+def _renewal_sweep_due(db, now: datetime) -> bool:
+    """兜底扫描现在该不该跑（按 SystemSetting 记录的上一轮时间）。"""
+    from admin.models import SystemSetting
+
+    interval = int(getattr(settings, "RENEWAL_SWEEP_SECONDS", 0) or 0)
+    if interval <= 0:
+        return False
+    row = db.get(SystemSetting, "keepalive:renewal_sweep_at")
+    try:
+        last = float(row.value) if row else 0
+    except (TypeError, ValueError):
+        last = 0
+    return (now.timestamp() - last) >= interval
+
+
+def _mark_renewal_sweep(db, now: datetime) -> None:
+    from admin.models import SystemSetting
+
+    row = db.get(SystemSetting, "keepalive:renewal_sweep_at")
+    if row is None:
+        db.add(SystemSetting(key="keepalive:renewal_sweep_at",
+                             value=str(now.timestamp())))
+    else:
+        row.value = str(now.timestamp())
+    db.commit()
+
+
 _scheduler_lock = threading.Lock()
 _scheduler_started = False
+
+
+#: 定时任务的默认周期与名称后缀。
+#:
+#: 为什么不再只认 `*_checkin` / `*_keepalive`：平台 `task_runners()` 声明的
+#: 任务远不止这两个，整点刷新余额、积分到期快照、模型同步、成长任务都需要在
+#: 库里有一条 Schedule 才会被调度线程执行。只种签到等于「平台接进来了，但只有
+#: 签到会跑」。这里按任务名给出默认周期，已存在的记录一律不覆盖（用户改过的
+#: 周期优先）。
+_TASK_SCHEDULE_META = {
+    "refresh_balances": ("整点刷新余额", 60),
+    "refresh_credits": ("积分到期快照", 360),
+    "sync_models": ("同步模型列表", 360),
+    "daily_checkin": ("每日签到", 1440),
+    "refresh_growth_tasks": ("更新成长任务", 360),
+    "run_growth_tasks": ("自动成长任务", 1440),
+    "run_growth_plan": ("成长计划", 240),
+    "keepalive_tokens": ("令牌保活", 360),
+    "ban_recheck": ("风控封号复核", 30),
+}
+
+
+def _schedule_meta(task: str, label: str) -> tuple[str, int]:
+    """任务名 → (展示名, 周期分钟)。"""
+    name = str(task)
+    if name in _TASK_SCHEDULE_META:
+        title, minutes = _TASK_SCHEDULE_META[name]
+        return f"{title} · {label}", minutes
+    if name.endswith("_checkin"):
+        return f"每日签到 · {label}", 1440
+    if name.endswith("_keepalive"):
+        return f"会话保活 · {label}", 360
+    if name.endswith("_refresh_quota"):
+        return f"刷新额度 · {label}", 360
+    return f"{name} · {label}", 360
 
 
 def ensure_platform_schedules(db):
@@ -1593,23 +1757,28 @@ def ensure_platform_schedules(db):
                                Account.status == "active").first()) is not None
         if not has_account:
             continue
+        # 平台 `task_runners()` 声明的任务**全部**补种（不只是签到/保活）：
+        # 各平台只声明自己的任务，不会把 WorkBuddy 的成长任务带进来。
         for task in runners:
             name = str(task)
-            if not (name.endswith("_checkin") or name.endswith("_keepalive")):
+            # ban_recheck 是全局任务，已有 ensure_ban_recheck_schedule 负责，
+            # 这里再按平台种一遍只会变成 N 条重复探测。
+            if name == "ban_recheck":
                 continue
             exists = (db.query(Schedule)
                       .filter(Schedule.task == name,
                               Schedule.platform == storage).first())
             if exists is not None:
                 continue
+            title, minutes = _schedule_meta(name, spec.label)
             is_checkin = name.endswith("_checkin")
             db.add(Schedule(
-                name=("每日签到 · %s" % spec.label) if is_checkin
-                     else ("会话保活 · %s" % spec.label),
+                name=title,
                 task=name,
                 platform=storage,
-                interval_minutes=1440 if is_checkin else 360,
+                interval_minutes=minutes,
                 enabled=1,
+                # 签到错开 5 分钟先跑；其余 15 分钟后排队，避免启动瞬间并发
                 next_run_at=now + (timedelta(minutes=5) if is_checkin
                                    else timedelta(minutes=15)),
             ))

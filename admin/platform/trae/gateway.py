@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session
 from admin.client_ip import request_ip
 from admin.db import SessionLocal
 from admin.platform import registry
+from admin.platform import protocol_bridge as bridge
 from admin.platform.registry import get as get_platform
 from admin.pool import POOL
 from admin.security import check_quota, get_key_row
@@ -235,10 +236,13 @@ _SOLO_CONTENT_GAP_S = 60.0
 
 def _timeout() -> float:
     from admin.config import settings
+    # 静默空闲上限：**不是总时长**。上游深度思考（静默 3~4 分钟）期间
+    # 只要还没有实质输出，也不允许在这里被掐断 —— 看门狗只在
+    # 「首包之后长时间无任何实质输出」时介入，且思考链也算进展。
     try:
-        return float(getattr(settings, "STREAM_IDLE_TIMEOUT", 180) or 180)
+        return float(getattr(settings, "STREAM_IDLE_TIMEOUT", 600) or 600)
     except Exception:  # noqa: BLE001
-        return 180.0
+        return 600.0
 
 
 def _tool_names(tools) -> set[str] | None:
@@ -431,6 +435,91 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
 
     msg_id = "msg_solo_" + str(int(time.time() * 1000))
     anthropic_started = {"done": False}
+    # ---- SOLO 工具调用的分片缓冲（按上游 index 分槽）----
+    # messages/responses 目标必须等 id+name 齐了才能开块（参数是
+    # 多帧拼接的）；约束与 `protocol_bridge` 对 OpenAI 流的处理一致。
+    # 此前 SOLO 路径把工具调用拼成 JSON 文本塞给客户端（「协议差异
+    # 太大，客户端自己解析」）—— Claude Code / Codex 根本不认，
+    # 表现就是 SOLO 模型跑任务时工具一轮直接断。
+    solo_tool_buf: dict = {}
+    solo_next_block = [1]      # 0 号块留给正文
+    solo_text_open = [False]
+    solo_text_block = [0]
+    solo_any_tool = [False]
+
+    def _solo_args_delta(slot) -> str:
+        """把缓冲里还没发出去的参数片段发成增量帧。"""
+        piece = slot.get("buf", "")[slot.get("flushed", 0):]
+        slot["flushed"] = len(slot.get("buf", ""))
+        if target == "messages":
+            return "data: %s\n\n" % _json.dumps(
+                {"type": "content_block_delta", "index": slot["block"],
+                 "delta": {"type": "input_json_delta", "partial_json": piece}},
+                ensure_ascii=False)
+        return "data: %s\n\n" % _json.dumps(
+            {"type": "response.function_call_arguments.delta",
+             "item_id": slot["item_id"], "output_index": slot["out_index"],
+             "delta": piece}, ensure_ascii=False)
+
+    def _solo_flush_tool(slot) -> list[str]:
+        """冲刷一个还没开块的工具槽（流结束前 id/name 一直没凑齐的兜底）。"""
+        out = _solo_open_tool(slot)
+        if slot["buf"]:
+            out.append(_solo_args_delta(slot))
+        if target == "messages":
+            out.append("data: %s\n\n" % _json.dumps(
+                {"type": "content_block_stop", "index": slot.get("block", -1)},
+                ensure_ascii=False))
+        else:
+            out.append("data: %s\n\n" % _json.dumps(
+                {"type": "response.output_item.done",
+                 "output_index": slot.get("out_index", 1),
+                 "item": {"type": "function_call", "id": slot.get("item_id", ""),
+                          "call_id": slot.get("id", ""),
+                          "name": slot.get("name", "") or "unknown",
+                          "arguments": slot.get("buf", ""), "status": "completed"}},
+                ensure_ascii=False))
+        return out
+
+    def _solo_open_tool(slot) -> list[str]:
+        """id+name 齐了：开工具块 / 加输出项，并把已缓冲的参数发出去。"""
+        out = []
+        if target == "messages":
+            if solo_text_open[0]:
+                out.append("data: %s\n\n" % _json.dumps(
+                    {"type": "content_block_stop", "index": solo_text_block[0]},
+                    ensure_ascii=False))
+                solo_text_open[0] = False
+            slot["block"] = solo_next_block[0]
+            solo_next_block[0] += 1
+            out.append("data: %s\n\n" % _json.dumps(
+                {"type": "content_block_start", "index": slot["block"],
+                 "content_block": {"type": "tool_use",
+                                   "id": slot["id"] or ("call_%d" % slot.get("_n", 0)),
+                                   "name": slot["name"] or "unknown",
+                                   "input": {}}},
+                ensure_ascii=False))
+        else:
+            slot["item_id"] = "fc_solo_%d_%d" % (int(time.time() * 1000),
+                                                 slot.get("_n", 0))
+            slot["out_index"] = 1
+            out.append("data: %s\n\n" % _json.dumps(
+                {"type": "response.output_item.added",
+                 "output_index": slot["out_index"],
+                 "item": {"type": "function_call", "id": slot["item_id"],
+                          "call_id": slot["id"] or ("call_%d" % slot.get("_n", 0)),
+                          "name": slot["name"] or "unknown",
+                          "arguments": "", "status": "in_progress"}},
+                ensure_ascii=False))
+        slot["added"] = True
+        # 开块时只补发**已缓冲**的参数；stop / output_item.done 必须等
+        # 流结束（finish 段统一关闭）—— SOLO 的参数是多帧增量，
+        # 这里提前关闭会让后续 input_json_delta / arguments.delta
+        # 落在已关闭的块上，收尾还会重复发一次关闭（协议违例）。
+        if slot.get("buf"):
+            out.append(_solo_args_delta(slot))
+        return out
+        return out
 
     def render_event(event) -> str:
         """把 SOLO 事件翻成**目标协议**的 SSE 帧。
@@ -475,9 +564,36 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
                                           "delta": {"tool_calls": converted},
                                           "finish_reason": None}]}
                     return "data: %s\n\n" % _json.dumps(chunk, ensure_ascii=False)
-                # anthropic / responses 协议：把工具调用拼成 JSON 文本块发下去，
-                # 由客户端自己解析（这两条协议的 tool_use 形状与 OpenAI 差异太大）
-                text = _json.dumps({"tool_calls": converted}, ensure_ascii=False)
+                # anthropic / responses 协议：分片缓冲 → tool_use 块 /
+                # function_call 输出项。原来拼成 JSON 文本塞给客户端，
+                # Claude Code / Codex 都不认 —— 工具一轮直接断。
+                solo_any_tool[0] = True
+                frames_out: list[str] = []
+                for n, call in enumerate(converted):
+                    # ⚠️ 槽位字段必须**一次给全**：原来只放 {"_n": n}，其余字段
+                    # 靠惰性赋值 —— `_solo_args_delta` 直接读 `slot["flushed"]`、
+                    # `_solo_flush_tool` 直接读 `slot["buf"]`，带参工具的第二片
+                    # 增量（或零参工具的收尾）当场 KeyError，SOLO 工具调用
+                    # 100% 中途断流（冒烟套件 test_platform_smoke 抓出来的）。
+                    slot = solo_tool_buf.setdefault(int(call.get("index") or n), {
+                        "_n": n, "id": "", "name": "", "buf": "",
+                        "flushed": 0, "added": False, "block": -1,
+                        "item_id": "", "out_index": 0})
+                    if call.get("id"):
+                        slot["id"] = str(call["id"])
+                    fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+                    if fn.get("name"):
+                        slot["name"] = slot.get("name", "") + str(fn["name"])
+                    piece = str(fn.get("arguments") or "")
+                    if piece:
+                        slot["buf"] = slot.get("buf", "") + piece
+                    if not slot.get("added"):
+                        if slot.get("id") and slot.get("name"):
+                            frames_out.extend(_solo_open_tool(slot))
+                        # id/name 未齐：继续等下一片
+                    elif len(slot.get("buf", "")) > slot.get("flushed", 0):
+                        frames_out.append(_solo_args_delta(slot))
+                return "".join(frames_out)
 
         if not reasoning and not text:
             return ""
@@ -496,8 +612,18 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
                 })
                 frames.append({"type": "content_block_start", "index": 0,
                                "content_block": {"type": "text", "text": ""}})
+                solo_text_open[0] = True
+                solo_text_block[0] = 0
+            elif solo_any_tool[0] and not solo_text_open[0]:
+                # 工具块之后再来的正文：0 号块已关，开新 text 块
+                solo_text_open[0] = True
+                solo_text_block[0] = solo_next_block[0]
+                solo_next_block[0] += 1
+                frames.append({"type": "content_block_start",
+                               "index": solo_text_block[0],
+                               "content_block": {"type": "text", "text": ""}})
             piece = text or reasoning
-            frames.append({"type": "content_block_delta", "index": 0,
+            frames.append({"type": "content_block_delta", "index": solo_text_block[0],
                            "delta": {"type": "text_delta", "text": piece}})
             return "".join("data: %s\n\n" % _json.dumps(f, ensure_ascii=False)
                            for f in frames)
@@ -615,15 +741,34 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
                     if isinstance(event.get("tool_calls"), list) and event["tool_calls"]:
                         saw_tool = True
                     if "prompt_tokens" in event:
-                        usage = {"prompt_tokens": int(event.get("prompt_tokens") or 0),
-                                 "completion_tokens": int(event.get("completion_tokens") or 0),
-                                 "total_tokens": int(event.get("total_tokens") or 0)}
+                        # 保留上游给的缓存命中等字段（只抄三个键会把它们丢掉）
+                        usage = {k: v for k, v in event.items()
+                                 if k.endswith("_tokens") or k in (
+                                     "cached_tokens", "prompt_tokens_details",
+                                     "completion_tokens_details",
+                                     "cache_read_input_tokens",
+                                     "cache_creation_input_tokens",
+                                     "prompt_cache_hit_tokens",
+                                     "credit", "credits", "cost")}
+                        usage["prompt_tokens"] = int(event.get("prompt_tokens") or 0)
+                        usage["completion_tokens"] = int(event.get("completion_tokens") or 0)
+                        usage["total_tokens"] = int(event.get("total_tokens") or 0)
+                        try:
+                            from upstream_compat import normalize_usage_cache
+
+                            normalize_usage_cache(usage)
+                        except Exception:  # noqa: BLE001
+                            pass
                     # 有实质输出就重置看门狗（正文/思考/工具都算进展）
                     if (event.get("response") or event.get("reasoning_content")
                             or event.get("tool_calls")):
                         _arm_watchdog(_SOLO_CONTENT_GAP_S)
-                    # TTFT 只认**正文/工具**；思考链不算「开始出字」
-                    if event.get("response") or event.get("tool_calls"):
+                    # TTFT 认**首个 token（正文/思考/工具）**：思考链也是
+                    # 用户能看到的输出流，且 completion_tokens 里包含
+                    # reasoning_tokens —— 分母必须同口径，否则思考模型的
+                    # 解码段只剩末尾几百毫秒，TPS 直接被判「量不出来」。
+                    if (event.get("response") or event.get("tool_calls")
+                            or event.get("reasoning_content")):
                         _now_c = time.perf_counter()
                         if first_content_at is None:
                             first_content_at = _now_c
@@ -648,9 +793,26 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
                 except Exception:  # noqa: BLE001
                     credit = 0.0
                 if target == "messages":
-                    yield "data: %s\n\n" % _json.dumps(
-                        {"type": "content_block_stop", "index": 0},
-                        ensure_ascii=False)
+                    # 工具块收尾：已开块的补 stop，没开块的整槽冲刷
+                    # （原来这里无条件关 0 号块、工具块永远不关，
+                    #  stop_reason 还把 "tool_calls" 原样塞给 Anthropic 客户端
+                    #  —— 它只认 "tool_use"）
+                    for _i in sorted(solo_tool_buf):
+                        _slot = solo_tool_buf[_i]
+                        if _slot.get("added"):
+                            yield "data: %s\n\n" % _json.dumps(
+                                {"type": "content_block_stop",
+                                 "index": _slot["block"]},
+                                ensure_ascii=False)
+                        else:
+                            for _f in _solo_flush_tool(_slot):
+                                yield _f
+                    if solo_text_open[0]:
+                        yield "data: %s\n\n" % _json.dumps(
+                            {"type": "content_block_stop",
+                             "index": solo_text_block[0]},
+                            ensure_ascii=False)
+                        solo_text_open[0] = False
                     # Anthropic 的 usage 要把缓存命中单列（cache_read_input_tokens），
                     # 漏了它客户端的命中率恒为 0，而平台侧账目是对的。
                     _a_u = None
@@ -672,16 +834,45 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
                                      "cost": credit})
                     yield "data: %s\n\n" % _json.dumps(
                         {"type": "message_delta",
-                         "delta": {"stop_reason": finish or "end_turn"},
+                         "delta": {"stop_reason":
+                                   {"tool_calls": "tool_use",
+                                    "length": "max_tokens"}.get(
+                                       finish or "", "end_turn")},
                          "usage": _a_u},
                         ensure_ascii=False)
                     yield "data: %s\n\n" % _json.dumps(
                         {"type": "message_stop"}, ensure_ascii=False)
                 elif target == "responses":
+                    # 工具项收尾：已加项的补 output_item.done（含完整参数），
+                    # 没加项的整槽冲刷。原来这里直接 response.completed，
+                    # Codex 拿不到 function_call 的最终参数。
+                    for _i in sorted(solo_tool_buf):
+                        _slot = solo_tool_buf[_i]
+                        if _slot.get("added"):
+                            yield "data: %s\n\n" % _json.dumps(
+                                {"type": "response.output_item.done",
+                                 "output_index": _slot.get("out_index", 1),
+                                 "item": {"type": "function_call",
+                                          "id": _slot.get("item_id", ""),
+                                          "call_id": _slot.get("id", ""),
+                                          "name": _slot.get("name", ""),
+                                          "arguments": _slot.get("buf", ""),
+                                          "status": "completed"}},
+                                ensure_ascii=False)
+                        else:
+                            for _f in _solo_flush_tool(_slot):
+                                yield _f
+                    _r_status = "completed"
+                    _r_incomplete = None
+                    if (finish or "stop") == "length":
+                        # 截断不能谎报 completed —— Codex 靠它决定要不要续写
+                        _r_status = "incomplete"
+                        _r_incomplete = {"reason": "max_output_tokens"}
                     yield "data: %s\n\n" % _json.dumps(
                         {"type": "response.completed",
                          "response": {"id": msg_id, "object": "response",
-                                      "status": "completed", "model": model,
+                                      "status": _r_status, "model": model,
+                                      "incomplete_details": _r_incomplete,
                                       "usage": {**(usage or {}),
                                                 **({"credit": credit,
                                                     "credits": credit,
@@ -718,8 +909,13 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
                            end_ms=(int((_last_at - started) * 1000)
                                    if _last_at else None))
 
+        # 空闲心跳：SOLO 上游排队/慢思考时整条流可能几十秒无字节；
+        # Anthropic 目标发官方 ping 事件，其余发 SSE 注释帧
         return StreamingResponse(
-            generator(), media_type="text/event-stream",
+            bridge.with_pings(
+                generator(),
+                ping=bridge.ANTHROPIC_PING if target == "messages" else bridge.CHAT_PING),
+            media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     result = trae_solo.collect(resp)
@@ -806,7 +1002,8 @@ def _bill_solo(db, key, account, model, usage, started, request, error="",
             storage="trae", error_kind=error,
             client_ip=_client_ip(request),
             use_case="trae-solo-chat",
-            ttfb_ms=ttfb, latency_ms=latency)
+            ttfb_ms=ttfb, latency_ms=latency,
+            reasoning_effort=shared.reasoning_effort_of_request(request))
     except Exception:  # noqa: BLE001
         logger.exception("SOLO 记账失败")
 
@@ -886,9 +1083,10 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
                 _bill(key, account, model, holder, ip, ttfb, attempted,
 "/v1/chat/completions", started=started)
 
-        return StreamingResponse(generator(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache",
-                                          "X-Accel-Buffering": "no"})
+        return StreamingResponse(
+            bridge.with_pings(generator(), ping=bridge.CHAT_PING),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     finally:
         db.close()
 
@@ -960,9 +1158,10 @@ async def responses(request: Request) -> StreamingResponse | JSONResponse:
                 _bill(key, account, model, holder, ip, ttfb, attempted,
 "/v1/responses", started=started)
 
-        return StreamingResponse(generator(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache",
-                                          "X-Accel-Buffering": "no"})
+        return StreamingResponse(
+            bridge.with_pings(generator(), ping=bridge.CHAT_PING),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     finally:
         db.close()
 
@@ -1032,9 +1231,10 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
                 _bill(key, account, model, holder, ip, ttfb, attempted,
 "/v1/messages", started=started)
 
-        return StreamingResponse(generator(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache",
-                                          "X-Accel-Buffering": "no"})
+        return StreamingResponse(
+            bridge.with_pings(generator(), ping=bridge.ANTHROPIC_PING),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     finally:
         db.close()
 
@@ -1207,6 +1407,7 @@ def _bill(key, account, model, holder, ip, ttfb_ms, attempted, path,
                 ttfb_ms=ttfb or total_ms,
                 latency_ms=total_ms or ttfb,
                 realm=str(holder.get("realm") or ""),
+                reasoning_effort=shared.reasoning_effort_of_request(request),
             )
     except Exception:  # noqa: BLE001
         logger.exception("trae 记账失败 path=%s", path)

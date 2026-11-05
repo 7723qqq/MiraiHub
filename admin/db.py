@@ -117,6 +117,26 @@ def init_db() -> bool:
         _ensure_column("request_audits", "client_ip", "VARCHAR(64)", "DEFAULT ''")
         _ensure_column("request_audits", "user_agent", "VARCHAR(512)", "DEFAULT ''")
 
+        # 迁移：封禁表的自动过期时间（NULL = 永久封禁）。
+        #
+        # 老库没有这一列，而 `is_blocked_ip()` 会按模型读全部列 —— 缺列会让
+        # 封禁查询直接抛异常，被 `except` 吞掉后退化成「谁都没被封」，
+        # 也就是**风控静默失效**。这种失效比报错更危险，所以迁移必须补齐。
+        _ensure_column("blocked_ips", "expires_at", "DATETIME", "NULL")
+
+        # join_invites 表（自助注册凭证）由 create_all 自动建表 —— 它是
+        # 全新的表而非老表的加列，所以不需要 _ensure_column。
+        #
+        # 语义是 fail-closed：表里一张有效凭证都没有 → `/join` 与
+        # `/api/join/*` 整体关闭（见 admin/join_gate.py）。
+        #
+        # 2026-11-05 加固：加 `epoch` 代次列。任何一次总闸 toggle 都会 +1，
+        # 旧代次的邀请码立即失效 —— 不需要逐条删，也就不会漏删。
+        _ensure_column("join_invites", "epoch", "INT", "NOT NULL DEFAULT 1")
+        _ensure_index("join_invites", "ix_join_invites_epoch", ("epoch",))
+
+        # admin_sessions / join_tickets 都是新表，create_all 会建。
+
         # 迁移：给 api_keys 表加 key_full 列（若不存在）
         _ensure_column("api_keys", "key_full", "VARCHAR(2048)", "DEFAULT ''")
 

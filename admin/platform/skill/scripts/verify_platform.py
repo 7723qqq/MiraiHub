@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -42,6 +43,18 @@ import urllib.request
 from http.cookiejar import CookieJar
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+# 仓库根要进 sys.path，否则 `python admin/platform/skill/scripts/verify_platform.py`
+# 只有脚本目录在 path 里，`import admin` 直接 ModuleNotFoundError。
+# 按「能不能看到 admin/__init__.py」向上找，别写死层数。
+_here = os.path.abspath(os.path.dirname(__file__))
+_root = _here
+for _ in range(6):
+    if os.path.isfile(os.path.join(_root, "admin", "__init__.py")):
+        break
+    _root = os.path.dirname(_root)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
 PASS = 0
 FAIL = 0
@@ -175,11 +188,14 @@ class Client:
                                      method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
         with self.opener.open(req, timeout=30) as resp:
-            self.token = json.loads(resp.read().decode())["token"]
+            # 2026-11-05 起 /api/login 不再在响应体里返回令牌：
+            # 凭证只存在于 HttpOnly Cookie，CookieJar 会自动带上。
+            body = json.loads(resp.read() or b"{}")
+            if not body.get("ok"):
+                raise RuntimeError("登录失败：%s" % body)
 
     def get(self, path: str, platform: str = "") -> tuple[int, dict]:
         req = urllib.request.Request(self.base + path)
-        req.add_header("X-Admin-Token", self.token)
         if platform:
             req.add_header("X-Platform", platform)
         try:
@@ -251,7 +267,7 @@ def check_browser(platform_id: str, base: str, user: str, password: str) -> None
           const x = new URLSearchParams({username: u, password: pw});
           const r = await fetch('/api/login',{method:'POST',body:x,
             headers:{'Content-Type':'application/x-www-form-urlencoded'}});
-          localStorage.setItem('wb_admin_token', (await r.json()).token);
+          if (!r.ok) throw new Error('login failed');
         }""", [user, password])
         page.reload(wait_until="domcontentloaded", timeout=60000)
         page.wait_for_function(

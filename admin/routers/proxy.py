@@ -4,6 +4,7 @@
 用该账号凭据转发到后端 → 流式返回 → 按用量回扣 Key 额度。
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -37,6 +38,8 @@ from upstream_compat import (
     cleanup_orphan_tool_calls,
     validate_tool_pairing,
     normalize_harness_body,
+    sanitize_messages,
+    sanitize_text,
 )
 
 HTTP_LIMITS = backend.HTTP_LIMITS
@@ -161,6 +164,8 @@ def _normalize_harness_body(chat_body: dict) -> dict:
             _logger.info("[harness-compat] 固定模板归一 %d 处", stats["templates"])
         if stats.get("shield"):
             _logger.info("[harness-compat] harness 提示词改写 %d 段（shield）", stats["shield"])
+        if stats.get("billing"):
+            _logger.info("[fingerprint] 计费指纹行整行删除 %d 条", stats["billing"])
         if stats.get("orphans"):
             _logger.warning("[harness-compat] 清理孤儿 tool_call %d 处 | diag=%s",
                             stats["orphans"], _tool_diag(chat_body))
@@ -200,6 +205,33 @@ def _tool_diag(chat_body: dict) -> str:
         return f"diag-failed:{e}"
 
 
+def _strip_channel_fingerprints(chat_body: dict) -> int:
+    """删掉客户端指纹，与 converter /gw 的 `prepare_upstream_body(sanitize=True)` 同款。
+
+    **顺序是语义**：必须先整行删 `x-anthropic-billing-header`，再做零宽空格脱敏。
+    脱敏会在词内部插 U+200B，`_HDR_RE` 之后就再也匹配不到这个头；而上游会
+    归一化零宽字符，于是「看起来改过了，字面仍然成立」—— 这正是 400/11128
+    长期稳定在 4~6% 的成因（实测：AUX 带 billHdr 88.4% 被拒，不带 4.3%）。
+
+    这一步**不受 `ANTHROPIC_DESENSITIZE` 开关约束**：指纹是渠道校验，不是内容审核。
+    """
+    try:
+        n = sanitize_messages(chat_body)
+        tools = chat_body.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                fn = tool.get("function") if isinstance(tool, dict) else None
+                if isinstance(fn, dict) and isinstance(fn.get("description"), str):
+                    new = sanitize_text(fn["description"])
+                    if new != fn["description"]:
+                        fn["description"] = new
+                        n += 1
+        return n
+    except Exception as e:
+        _logger.warning("[fingerprint] 净化失败，按原样发送：%s", e)
+        return 0
+
+
 def _desensitize_chat_body(chat_body: dict) -> dict:
     """harness 脱敏（CC / OpenAI 反代 / converter /gw 共用同一套）。
 
@@ -208,6 +240,10 @@ def _desensitize_chat_body(chat_body: dict) -> dict:
     /v1/messages 早就做了这一步；/v1/chat/completions、/v1/responses 若不同步，
     就会出现「CC 能用、OpenAI 反代发不出去」。
     """
+    # 指纹净化无条件执行且必须早于脱敏；三条 /v1/* 链路都从这里过。
+    removed = _strip_channel_fingerprints(chat_body)
+    if removed:
+        _logger.info("[fingerprint] 客户端指纹净化 %d 处", removed)
     if not (_DESENSITIZE_AVAILABLE and settings.ANTHROPIC_DESENSITIZE):
         return chat_body
     try:
@@ -295,11 +331,33 @@ def _session_headers(body: dict, uid: str) -> dict:
     return h
 
 
+def upstream_conversation_id(body: dict) -> str:
+    """本次 upstream 调用声明的「会话」。
+
+    优先用客户端显式给的会话标识（原样转发 —— 那是它自己的对话 id）；
+    没有时用**首条 user 消息**派生一个 32 位十六海的稳定值，而不是留空。
+
+    留空的后果不是"没有会话"，而是 `trace_headers` 每请求现造一个 UUID：
+    上游眼里每次请求都是全新对话，前缀缓存永远打不中，一个号一分钟内
+    能"新建"几十个会话 —— 这既是缓存浪费，也是风控最敏感的形状。
+    """
+    body = body if isinstance(body, dict) else {}
+    explicit = pool.extract_session_key(body)
+    if explicit:
+        return explicit
+    derived = pool.session_key_for(body)
+    if not derived:
+        return ""
+    return hashlib.sha256(("workbuddy|" + derived).encode("utf-8")).hexdigest()[:32]
+
+
 def _turn_headers(body: dict, purpose: str) -> tuple[str, str]:
     """Resolve (conversation, turn) once per gateway request.
 
-    The conversation id comes from the caller when it supplied one; the turn id
-    is stable for every attempt that belongs to this gateway request, so a
+    The conversation id comes from the caller when it supplied one; otherwise
+    ``upstream_conversation_id`` derives a stable one (see its docstring — the
+    empty case used to randomise the conversation on every request). The turn
+    id is stable for every attempt that belongs to this gateway request, so a
     rotated/retried request still reads as one turn upstream. ``purpose`` is
     accepted so endpoints can state their use case at the same place.
 
@@ -309,30 +367,20 @@ def _turn_headers(body: dict, purpose: str) -> tuple[str, str]:
     instead of being pinned to the turn.
     """
     del purpose
-    conversation = pool.extract_session_key(body) if isinstance(body, dict) else ""
+    conversation = upstream_conversation_id(body)
     return conversation, identity.turn_id(body if isinstance(body, dict) else None)
 
 
 
 def _reasoning_effort(payload: dict) -> str:
-    """Keep only a bounded request setting, never prompts or arbitrary payloads."""
-    effort = payload.get("reasoning_effort") or payload.get("reasoningEffort")
-    reasoning = payload.get("reasoning")
-    if not effort:
-        effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
-    allowed = {"off", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto"}
-    if isinstance(effort, str) and effort.strip().lower() in allowed:
-        return effort.strip().lower()
-    thinking = payload.get("thinking")
-    if isinstance(thinking, dict):
-        if thinking.get("type") == "disabled":
-            return "off"
-        budget = thinking.get("budget_tokens")
-        if isinstance(budget, int) and not isinstance(budget, bool) and 0 <= budget <= 10**9:
-            return f"budget:{budget}"
-        if thinking.get("type") in ("enabled", "adaptive"):
-            return thinking["type"]
-    return ""
+    """Keep only a bounded request setting, never prompts or arbitrary payloads.
+
+    实现已收敛到 `admin.platform.shared.reasoning_effort_of` —— 各平台网关记账时
+    也要记同一个口径，不能各写一份（否则日志里同一个请求会有两种值）。
+    """
+    from admin.platform.shared import reasoning_effort_of
+
+    return reasoning_effort_of(payload)
 
 
 def _record_usage(key_id: int, account_id: int, model: str, credits: float | None,
@@ -1683,6 +1731,31 @@ def _trusted_auth_probe(acc: Account) -> tuple[str, str]:
                 pass
 
 
+def _refresh_if_suspect(acc: Account, sess) -> None:
+    """access token 已过期/即将过期时，在发请求**之前**先续一次命。
+
+    为什么放在这里而不是等 401：`get_headers()` 只在本地 `expiresAt` 临近
+    （60 秒）时才刷，而 `expiresAt` 是**落库那一刻**算出来的绝对值 ——
+    一个号在池子里躺了 31 天没人用，expiresAt 早就过了，第一次命中它必然
+    401，然后靠 `_request_with_refresh` 补救。那条补救路径本身是对的，
+    但它每次都白烧一次上游请求，而且在 401 与「session 真的死了」之间，
+    号池要先用一轮计数才敢下结论 —— 表现就是「到期后第一次请求总是慢/失败」。
+
+    提前刷一次把这条弯路绕掉：刷新只需要一个 `X-Refresh-Token` 头，
+    实测 access 过期与否都能换回新令牌（见 `admin/token_expiry.py` 实测记录）。
+
+    失败一律吞掉：刷新失败不代表请求不能发（也许上游还认旧 token），
+    真正的判据是上游的响应，不是本地的猜测。
+    """
+    try:
+        if sess.cm._is_expired():
+            sess.cm.force_refresh()
+            # 刷新会换 token，重建的头才带新的 Authorization。
+            sess._gateway_headers = sess.get_headers()
+    except Exception:      # noqa: BLE001 - 刷新失败交给上游响应裁决
+        pass
+
+
 def _account_session_safe(db: Session, acc: Account) -> backend.AccountSession | None:
     """创建 AccountSession 并调用 get_headers()（可能触发 token 刷新）。
 
@@ -1708,6 +1781,7 @@ def _account_session_safe(db: Session, acc: Account) -> backend.AccountSession |
                     original = row[0]
                     sess = backend.AccountSession(original)
                     sess._gateway_headers = sess.get_headers()
+                    _refresh_if_suspect(acc, sess)
                     updated = sess.updated_json()
                     if json.loads(updated) != json.loads(original):
                         changed = auth_db.query(Account).filter(
@@ -2212,9 +2286,25 @@ def _select_account(db: Session, exclude_ids: set | None = None,
     # Explicit user order outranks stickiness, expiry and free-model balancing.
     # Health/model limits, ownership and capacity were already checked above.
     from admin.selection_order import manual_priority
-    priority = min(manual_priority(a) for a in rows)
-    if priority != float('inf'):
-        rows = [a for a in rows if manual_priority(a) == priority]
+    _priority = min(manual_priority(a) for a in rows)
+    if _priority != float('inf'):
+        # 默认**只取最小优先级那一档**：用户把某个号拖到第 1 位，意思就是
+        # 「先烧它」，不该自作主张把第 2、3 名也掺进来轮转。
+        #
+        # 可选的放宽（ADMIN_SELECTION_ROTATE_N）：保留前 N 档做组内轮转。
+        # 只在多号手动排序且想让它们平摊时才有意义；默认关闭，
+        # 因为「按我排的顺序走」是这一屏最核心的承诺，静默改变它比轮转不均更糟。
+        try:
+            _prio_n = max(1, int(os.getenv("ADMIN_SELECTION_ROTATE_N", "1")))
+        except (TypeError, ValueError):
+            _prio_n = 1
+        if _prio_n == 1:
+            rows = [a for a in rows if manual_priority(a) == _priority]
+        else:
+            _allow = set(sorted({manual_priority(a) for a in rows})[:_prio_n])
+            _filtered = [a for a in rows if manual_priority(a) in _allow]
+            if _filtered:
+                rows = _filtered
 
     strategy = routing_policy.selection_mode(db)
     if strategy == 'throughput':
@@ -2237,14 +2327,47 @@ def _select_account(db: Session, exclude_ids: set | None = None,
 
     candidates = rows
     if not free_model and strategy == 'expiring':
-        best = min(pool.expiry_key(a, now) for a in candidates)
-        candidates = [a for a in candidates if pool.expiry_key(a, now) == best]
+        # **前 N 名轮转，而不是死盯第 1 名**。
+        #
+        # 原实现取 `expiry_key == best` 的**并列档**：只要有一个号的到期时间
+        # 最早，它就是唯一候选 —— 实测 300 次选号全落在同一个号上
+        # （用户反馈：「一直逮着一个号薅，第一名天天在跑，二三名挂着不动」）。
+        # 而积分到期优先的本意是「先烧快作废的」，不是「只烧一个号」，
+        # 二三名同样会到期，一直不动照样浪费。
+        #
+        # 现在取**到期最紧迫的前 N 个**做短名单（N 默认 3，可用
+        # ADMIN_EXPIRY_ROTATE_N 调整），再在名单内按「在途数 → 最近使用时间」
+        # 轮转。既保证「快过期的先走」，又让前几名都能被消耗到。
+        try:
+            rotate_n = max(1, int(os.getenv("ADMIN_EXPIRY_ROTATE_N", "3")))
+        except (TypeError, ValueError):
+            rotate_n = 3
+        ranked = sorted(candidates,
+                        key=lambda a: (pool.expiry_key(a, now),
+                                       -int(getattr(a, "balance_remain", 0) or 0),
+                                       a.id))
+        candidates = ranked[:rotate_n]
     # Apply the short collision window inside a strict expiry tier only.
     fresh = [a for a in candidates if POOL.recent.fresh(a.uid or '')]
     candidates = fresh or candidates
     POOL.recent.prune()
+    # 轮转用的排序键，按优先级从强到弱：
+    #   1. 在途请求数（并发必须摊平，否则单号过载 → 成片 429）
+    #   2. `last_picked_at` —— **本次进程内最近一次被选中**的时刻
+    #   3. `last_used_at` —— 真实用过的时间（落库，跨重启）
+    #   4. id（最后的确定性兜底，避免排序不稳定）
+    #
+    # 为什么必须看 `last_picked_at`：`last_used_at` 是落库字段，
+    # 同一秒内连续几百次选号它的值相同，排序会退化成「永远选 id 最小的」，
+    # 于是短名单里有 3 个号、流量仍然全压在第 1 个（实测 296/300）。
+    # `last_picked_at` 在选中时立刻写内存，能真正把「刚用过的」排到后面。
+    def _picked_at(a):
+        return getattr(a, "last_picked_at", None) or datetime.min
+
     load_key = lambda a: (POOL.inflight.count(a.uid or ''),
-                          a.last_used_at or datetime.min, a.id)
+                          _picked_at(a),
+                          a.last_used_at or datetime.min,
+                          a.id)
     if strategy == 'throughput':
         acc = min(candidates, key=load_key) if free_model else min(
             candidates, key=lambda a: (pool.expiry_key(a, now), *load_key(a)))

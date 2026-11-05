@@ -23,8 +23,10 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import os
 import threading
 import time
 
@@ -257,6 +259,51 @@ def mark_stage(rid: str, stage: str) -> None:
         logger.debug("traffic mark_stage 失败", exc_info=True)
 
 
+def annotate(rid: str, **fields) -> None:
+    """往**已经存在的** running 记录里补字段（不新建记录）。
+
+    为什么需要：一条请求在网关里会穿过好几层中间件，每层都知道一点信息：
+    外层（TimingMiddleware）知道 Key 与来源 IP，dispatch 层知道平台猜测，
+    平台网关知道真实平台。以前每层都调 `start()` 各建一条 —— 后建的那条
+    会覆盖 `scope["_wb_traffic_rid"]`，**先建的那条就再也没人收尾**，
+    永久挂在面板上显示「已接收 / 选路中」。
+
+    现在统一成：最外层建一次，后面各层只 `annotate` 补充信息。
+    只允许改展示字段，不动 rid / ts（它们决定身份与排序）。
+    """
+    if not rid or not fields:
+        return
+    allowed = {"platform", "model", "key_label", "client_ip", "path", "stage"}
+    patch = {k: v for k, v in fields.items() if k in allowed and v not in (None, "")}
+    if not patch:
+        return
+    try:
+        client = _client()
+        raw = None
+        if client is not None:
+            try:
+                raw = client.hget(RUNNING_KEY, rid)
+            except Exception:  # noqa: BLE001
+                raw = None
+        if raw is None:
+            with _lock:
+                item = _memory_running.get(rid)
+                if item is None:
+                    return
+                item.update(patch)
+            return
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        item = json.loads(raw)
+        if not isinstance(item, dict):
+            return
+        item.update(patch)
+        if client is not None:
+            client.hset(RUNNING_KEY, rid, json.dumps(item, ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        logger.debug("traffic annotate 失败", exc_info=True)
+
+
 def finish_running(rid: str) -> None:
     """请求结束时清掉 running 占位（`record()` 会写入正式记录）。"""
     if not rid:
@@ -272,6 +319,82 @@ def finish_running(rid: str) -> None:
         pass
 
 
+def stale_running_seconds() -> float:
+    """「进行中」记录超过这个岁数就判定为僵尸。
+
+    为什么需要：`running` 只靠请求自己回来 `finish_running()` 清理。
+    只要有一条路径没走到收尾（进程被 kill、任务被取消、stream 生成器
+    没被关闭、早期版本的 bug），这条记录就会**永久**躺在 RUNNING_KEY 里：
+    面板上一直显示「已接收 / 选路中」，`running` 计数只增不减。
+    实测重启进程后仍然能看到一小时前的「进行中」—— 因为它存在 Redis 里。
+
+    阈值取 `网关请求超时 + 120 秒`：网关自己会在 timeout 时强制取消任务，
+    超过这个岁数还活着的记录一定是收尾丢了，不可能是真的在跑。
+    """
+    base = 300.0
+    try:
+        from admin.config import settings
+
+        base = float(getattr(settings, "GATEWAY_REQUEST_TIMEOUT", 300) or 300)
+    except Exception:  # noqa: BLE001 - 配置读不到就用默认
+        pass
+    return max(120.0, base + 120.0)
+
+
+def prune_stale_running(items: list[dict] | None = None) -> int:
+    """清掉僵尸「进行中」记录，返回清掉的条数。
+
+    `items` 是调用方已经读出来的 running 列表（`snapshot()` 本来就要读一次
+    HGETALL，复用它可以省掉一轮往返）。传 None 时自己读。
+    绝不抛异常。
+    """
+    try:
+        client = _client()
+        if items is None:
+            if client is not None:
+                raw_items = client.hvals(RUNNING_KEY)
+            else:
+                with _lock:
+                    raw_items = list(_memory_running.values())
+            items = []
+            for raw in raw_items:
+                if isinstance(raw, dict):
+                    items.append(raw)
+                    continue
+                try:
+                    items.append(json.loads(raw))
+                except Exception:  # noqa: BLE001
+                    continue
+        cutoff = time.time() - stale_running_seconds()
+        stale = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                ts = float(item.get("ts") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            # ts 缺失 / 明显是旧记录 → 一起清掉，否则它会永远留在列表里
+            if ts and ts >= cutoff:
+                continue
+            rid = str(item.get("rid") or "")
+            if rid:
+                stale.append(rid)
+        if not stale:
+            return 0
+        if client is not None:
+            client.hdel(RUNNING_KEY, *stale[:200])
+        else:
+            with _lock:
+                for rid in stale:
+                    _memory_running.pop(rid, None)
+        logger.info("清理僵尸 running 记录 %d 条", len(stale))
+        return len(stale)
+    except Exception:  # noqa: BLE001 - 清理失败不影响展示
+        logger.debug("清理僵尸 running 失败", exc_info=True)
+        return 0
+
+
 def record(platform: str, *, outcome: str, status: int = 0,
            elapsed_ms: float = 0, model: str = "", path: str = "",
            error: str = "", at: float | None = None,
@@ -282,12 +405,16 @@ def record(platform: str, *, outcome: str, status: int = 0,
     `path` 不是对话端点时直接跳过 —— 口径见 `TRACKED_PATHS`。
     """
     try:
-        _path = str(path or "").strip()
-        if _path:
-            if _path in SKIP_PATHS:
-                return
-            if _path not in TRACKED_PATHS:
-                return
+        # ⚠️ **先清 running，再做任何过滤**。
+        #
+        # 原来这行在函数末尾，而上面两个 `return`（SKIP_PATHS / 不在
+        # TRACKED_PATHS 的路径）会绕过它 —— 于是 `/v1/models`、
+        # `/v1/balance` 这类"要统计但不在对话白名单里"的请求，
+        # 每次都在 Redis 里留下一条永远不消失的「进行中」。
+        # 实测：点几次模型列表，面板上就多几条「streaming」，越积越多。
+        #
+        # `finish_running` 是幂等的（HDEL），放最前面不会重复扣减。
+        finish_running(rid)
         platform = _normalize(platform)
         now = at if at is not None else time.time()
         status = int(status or 0)
@@ -319,7 +446,6 @@ def record(platform: str, *, outcome: str, status: int = 0,
         # 结束前的最后阶段由调用方给（比如上游已开始回数据就是 streaming），
         # 但结果记录本身统一按 done 展示 —— 这里只在没有 rid 时兜底用。
         del stage  # 保留参数位，避免调用方传了就报错
-        finish_running(rid)
         day = _day()
         client = _client()
         if client is not None:
@@ -364,8 +490,35 @@ def record(platform: str, *, outcome: str, status: int = 0,
         logger.debug("流量统计写入失败", exc_info=True)
 
 
+#: 平台枚举缓存。注册表在进程内基本不变，而 `snapshot()` 会被多个面板/
+#: 多标签页轮询 —— 每 2 秒重建一次列表纯属浪费。
+_PLATFORM_IDS_TTL = 60.0
+_platform_ids_cache: dict = {"ts": 0.0, "rows": []}
+
+#: 快照短缓存（秒）。
+#:
+#: 为什么必须缓存：`/api/sentinel/traffic` 会被「平台网关」和「用量日志」
+#: 两个面板各自轮询，前端还有 SSE。没有缓存时每次请求都要
+#:   hgetall × N 平台 + scan_iter 全键空间 + zrangebyscore + hvals(running)
+#: 线上数据量一大，3 秒一次的轮询就变成压死 Redis 和 uvicorn 的那根稻草。
+#: 2 秒窗口：面板本来就是秒级刷新，肉眼看不出差别，但请求量能合并掉一大半。
+_SNAPSHOT_TTL = float(os.getenv("ADMIN_TRAFFIC_CACHE_TTL", "2") or 2)
+_snapshot_cache: dict = {}
+_snapshot_lock = threading.Lock()
+
+
 def _platform_ids() -> list[tuple[str, str]]:
-    """`[(public_id, label)]`，按登记顺序。"""
+    """`[(public_id, label)]`，按登记顺序（带 60 秒缓存）。"""
+    now = time.time()
+    cached = _platform_ids_cache
+    if cached["rows"] and now - cached["ts"] < _PLATFORM_IDS_TTL:
+        return cached["rows"]
+    rows = _platform_ids_now()
+    _platform_ids_cache.update(ts=now, rows=rows)
+    return rows
+
+
+def _platform_ids_now() -> list[tuple[str, str]]:
     try:
         from admin.platform import registry
         from admin.platform.loader import load_platforms
@@ -381,6 +534,29 @@ def _platform_ids() -> list[tuple[str, str]]:
 
 
 def snapshot(window: int = 3600) -> dict:
+    """今日各平台计数 + 最近 `window` 秒的请求明细（带 2 秒合并缓存）。
+
+    返回值是**深拷贝**：调用方（如 sentinel_router 按平台过滤）会就地改
+    `platforms` / `recent` 字段，直接返回缓存对象会被改脏。
+    """
+    win = max(60, int(window))
+    key = (_day(), win)
+    now = time.time()
+    with _snapshot_lock:
+        hit = _snapshot_cache.get(key)
+        if hit and now - hit[0] < _SNAPSHOT_TTL:
+            return copy.deepcopy(hit[1])
+    data = _snapshot_now(win)
+    with _snapshot_lock:
+        # 只留最近几个窗口，避免长跑进程里无限增长
+        if len(_snapshot_cache) > 6:
+            for old in sorted(_snapshot_cache, key=lambda k: _snapshot_cache[k][0])[:3]:
+                _snapshot_cache.pop(old, None)
+        _snapshot_cache[key] = (time.time(), copy.deepcopy(data))
+    return data
+
+
+def _snapshot_now(window: int = 3600) -> dict:
     """今日各平台计数 + 最近 `window` 秒的请求明细。"""
     day = _day()
     since = time.time() - max(60, int(window))
@@ -456,6 +632,36 @@ def snapshot(window: int = 3600) -> dict:
     else:
         with _lock:
             running = list(_memory_running.values())
+
+    # **清僵尸**：早该结束却还挂在 running 里的记录（进程被 kill、任务被取消、
+    # 生成器没关……）会永久占着面板的「进行中」并虚增计数。这里就地清掉，
+    # 否则用户看到的是「一小时前的请求还在已接收」—— 以为网关卡死了。
+    cutoff = time.time() - stale_running_seconds()
+    alive: list[dict] = []
+    stale_ids: list[str] = []
+    for item in running:
+        try:
+            ts = float(item.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts and ts >= cutoff:
+            alive.append(item)
+        else:
+            rid = str(item.get("rid") or "")
+            if rid:
+                stale_ids.append(rid)
+    if stale_ids:
+        try:
+            if client is not None:
+                client.hdel(RUNNING_KEY, *stale_ids[:200])
+            else:
+                with _lock:
+                    for rid in stale_ids:
+                        _memory_running.pop(rid, None)
+            logger.info("清理僵尸 running 记录 %d 条（面板不再显示）", len(stale_ids))
+        except Exception:  # noqa: BLE001
+            logger.debug("清理僵尸 running 失败", exc_info=True)
+    running = alive
 
     seen = {str(item.get("rid") or "") for item in recent if item.get("rid")}
     running = [r for r in running if str(r.get("rid") or "") not in seen]

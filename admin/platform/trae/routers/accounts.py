@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -19,7 +21,7 @@ from sqlalchemy.orm import Session
 from admin.db import get_db
 from admin.models import Account, AccountModelCooldown
 from admin.platform.registry import get as get_platform
-from admin.security import require_admin
+from admin.security import require_admin, clean_display_name
 from admin.platform.trae.core import catalog, client
 from admin.platform.trae.services import accounts as trae_accounts
 from admin.platform.trae.services import desktop_catalog
@@ -97,12 +99,46 @@ def meta(_: bool = Depends(require_admin)):
 # ---------------------------------------------------------------------------
 # 账号
 # ---------------------------------------------------------------------------
+def _trae_base_query(db, realm: str):
+    """trae 账号的基础查询（platform + 区域），供列表/聚合共用。"""
+    from admin.models import Account
+
+    q = db.query(Account).filter(Account.platform == "trae")
+    if realm:
+        q = q.filter(Account.domain == realm)
+    return q
+
+
 @router.get("/accounts")
 def list_accounts(realm: str = "", _: bool = Depends(require_admin),
-                  db: Session = Depends(get_db)):
-    """号池列表（含额度与到期快照）。"""
+                  db: Session = Depends(get_db), request: Request = None):
+    """号池列表（含额度与到期快照）。
+
+    无 `page` 参数 = 旧的全量行为；传 `page` 走服务端分页 +
+    SQL 聚合 summary（大号池渲染/内存优化，与通用 /api/accounts 同语义）。
+    """
+    from admin.platform.shared import (list_page_params, apply_account_filters,
+                                       account_order, summarize_accounts_sql)
+
     realm = _realm_or_400(realm) if realm else ""
-    rows = trae_pool.accounts_for(db, realm)
+    lp = list_page_params(request)
+
+    query = _trae_base_query(db, realm)
+    query = apply_account_filters(
+        query, Account, search=lp["search"], status=lp["status"],
+        min_credits=lp["min_credits"], max_credits=lp["max_credits"])
+    query = account_order(query, Account, lp["sort"])
+
+    if lp["paginated"]:
+        from sqlalchemy import func as _func
+
+        total = int(query.with_entities(
+            _func.count(Account.id)).scalar() or 0)
+        rows = (query.offset((lp["page"] - 1) * lp["page_size"])
+                .limit(lp["page_size"]).all())
+    else:
+        rows = query.all()
+
     items = []
     for row in rows:
         view = trae_accounts.public_view(row)
@@ -121,11 +157,23 @@ def list_accounts(realm: str = "", _: bool = Depends(require_admin),
             "quota": quota,
             "last_used_at": row.last_used_at.isoformat() if row.last_used_at else None,
             "last_sync_at": row.last_sync_at.isoformat() if row.last_sync_at else None,
+            # 入库时间：账号池表格的「入库时间」列（全平台统一）
+            "created_at": row.created_at.isoformat() if row.created_at else None,
             "cool_until": row.cool_until.isoformat() if row.cool_until else None,
             "cool_kind": row.cool_kind or "",
             "last_err_msg": row.last_err_msg or "",
             **view,
         })
+    if lp["paginated"]:
+        # tab 计数不吃状态筛选（显示全池分布）
+        agg_q = apply_account_filters(
+            _trae_base_query(db, realm), Account, search=lp["search"],
+            status="", min_credits=lp["min_credits"],
+            max_credits=lp["max_credits"])
+        return {"items": items,
+                "summary": summarize_accounts_sql(agg_q, Account),
+                "paginated": True, "total": total,
+                "page": lp["page"], "page_size": lp["page_size"]}
     return {"items": items, "summary": trae_pool.summarize(rows)}
 
 
@@ -146,9 +194,13 @@ def _quota_view(row: Account) -> dict:
 
 
 @router.get("/scan-local")
-def scan_local(_: bool = Depends(require_admin)):
-    """扫描本机 Trae 客户端登录态（国内版 + 国际版）。"""
+def scan_local(realm: str = "", _: bool = Depends(require_admin)):
+    """扫描本机 Trae 客户端登录态，可按当前平台区域收窄结果。"""
+    realm = _realm_or_400(realm) if realm else ""
     result = trae_accounts.discover()
+    if realm:
+        result["items"] = [item for item in (result.get("items") or [])
+                           if str(item.get("realm") or "").lower() == realm]
     result["storage"] = trae_accounts.appdata_hint()
     return result
 
@@ -196,9 +248,20 @@ def _infer_public_base(request: Request | None) -> str:
     # 去掉可能残留的 userinfo（user@host）
     if "@" in host:
         host = host.rsplit("@", 1)[1]
+    # Host 头来自客户端，必须只接受合法主机名字符。
+    # 否则 `Host: evil.com\x00...` 之类的畸形值会污染上游回调地址，
+    # 变成开放重定向 / 回调劫持面（事故报告 R13 的残留）。
+    if len(host) > 253 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.\-:\[\]]*", host):
+        return ""
     bare = host.split(":")[0].strip().lower()
     if bare in _LOOPBACK_HOSTS:
         return ""                              # 回环推导不出公网地址
+    # 可选：运维显式声明可信的对外主机名（逗号分隔，不含端口）。
+    # 配了之后，反代若没有覆写 X-Forwarded-Host，伪造的 Host 也过不了。
+    allowed = [h.strip().lower() for h in
+               (os.environ.get("ADMIN_PUBLIC_HOSTS") or "").split(",") if h.strip()]
+    if allowed and bare not in allowed:
+        return ""
 
     proto = (first("x-forwarded-proto") or "").strip().lower()
     if proto not in ("http", "https"):
@@ -906,9 +969,10 @@ def _finish_trae_account(db: Session, session, token_data: dict,
 
 
 @router.post("/import-local")
-def import_local(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    """把本机扫描到的凭证导入统一号池。"""
-    return trae_accounts.import_local(db)
+def import_local(realm: str = "", _: bool = Depends(require_admin),
+                 db: Session = Depends(get_db)):
+    """把本机扫描到的凭证导入统一号池，可按当前平台区域收窄。"""
+    return trae_accounts.import_local(db, _realm_or_400(realm) if realm else "")
 
 
 class ImportIn(BaseModel):
@@ -943,6 +1007,17 @@ def import_credential(body: ImportIn, _: bool = Depends(require_admin),
     return {"added": added, "updated": updated, "errors": errors}
 
 
+class ImportBatchIn(BaseModel):
+    text: str = ""
+
+
+@router.post("/import-batch")
+def import_batch(body: ImportBatchIn, _: bool = Depends(require_admin),
+                 db: Session = Depends(get_db)):
+    """从手机版备份批量导入 Trae 账号（issue #8：除 workbuddy 外都能导入）。"""
+    return trae_accounts.import_batch(db, body.text)
+
+
 class PatchIn(BaseModel):
     name: str | None = None
     status: str | None = None
@@ -954,7 +1029,7 @@ def patch_account(acc_id: int, body: PatchIn, _: bool = Depends(require_admin),
                   db: Session = Depends(get_db)):
     account = _get(db, acc_id)
     if body.name is not None:
-        account.name = body.name[:120]
+        account.name = clean_display_name(body.name[:120], account.name)
     if body.status in ("active", "disabled"):
         account.status = body.status
         if body.status == "active":

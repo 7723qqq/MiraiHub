@@ -126,9 +126,26 @@ class WorkBuddyAccountOps:
         return accounts_router.health_check(account_id, _=True, db=db)
 
     def inject(self, db, account_id):
-        from admin import client_profile
+        """把账号写成本机客户端的当前登录态（`.info` + observation 旁证）。
 
-        return client_profile.inject(db, account_id)
+        原来这里调 `client_profile.inject()` —— **那个函数根本不存在**
+        （`client_profile` 只负责客户端参数档案），任何走到这条路的调用
+        都会 `AttributeError`。真正的实现在 `core/client_session.py`，
+        与 `/api/accounts/{id}/inject` 路由共用同一套逻辑（备份、原子写、
+        写后校验、客户端占用检测）。
+        """
+        from admin.models import Account
+        from admin.platform.workbuddy.core import client_session
+        from admin.platform.workbuddy.core.credential_codec import (
+            encrypt_credential,
+        )
+
+        acc = db.query(Account).filter(Account.id == account_id).first()
+        if acc is None:
+            raise ValueError("账号不存在")
+        payload = encrypt_credential(acc.auth_json)
+        return client_session.inject(payload=payload, uid=str(acc.uid or ""),
+                                     name=acc.name or "")
 
     def export(self, db, ids=None):
         from admin.routers import accounts as accounts_router
@@ -216,6 +233,25 @@ class WorkBuddyGateway:
     # ---- 客户端探测 ----
     def client_probe(self) -> ClientProbe:
         return WorkBuddyClientProbe()
+
+    # ---- 凭证有效期 ----
+    def credential_expiry(self, auth_json) -> dict:
+        """解析本平台凭证的两条时间线（access / refresh）。
+
+        admin 侧只消费结果，不关心 .info 的内部结构 —— 这正是
+        `test_gateway_contract` 的「admin 平台无关性」要求的东西。
+        """
+        # 别名导入：模块名与方法名撞车时，同名局部变量会让本方法与模块
+        # 变成两个不同的对象，后面再想按名字取模块就取不到了。
+        from admin.platform.workbuddy.core import credential_expiry as expiry
+
+        return expiry.token_expiry(auth_json)
+
+    def renewal_guard_days(self) -> int:
+        """续期窗口「告急」阈值（天），供 admin 的兜底调度使用。"""
+        from admin.platform.workbuddy.core import credential_expiry as expiry
+
+        return int(expiry.RENEWAL_GUARD_DAYS)
 
     # ---- 概览卡片 ----
     def overview_cards(self, db) -> list[dict]:

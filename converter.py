@@ -35,13 +35,91 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
-from admin.config import settings
-from admin.upstream_errors import UpstreamError
 
 import upstream_compat
 
 # 连接池：减少重复 TLS 握手； MaxIdleConnsPerHost=20 设计。
 _HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+
+
+def _upstream_trust_env() -> bool:
+    """上游请求是否继承系统代理。
+
+    与 `admin.upstream_http.upstream_trust_env()` 读同一个环境变量、同一口径
+    （`ADMIN_UPSTREAM_TRUST_ENV`，默认不继承）。这里不 import admin：
+    模块导入期碰 admin 会触发下面的循环导入。
+    """
+    return os.environ.get("ADMIN_UPSTREAM_TRUST_ENV", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# 循环导入守卫
+# ---------------------------------------------------------------------------
+#
+# `from admin.upstream_errors import UpstreamError` 这一行看起来无害，但它会把
+# `admin` 包初始化一遍；而 `admin/__init__.py` 里的 `_install_module_aliases()`
+# 会导入 `admin.platform.workbuddy.core.backend`，那个模块第 17 行写的是
+#
+#     from converter import BACKEND, CredentialError, CredentialManager
+#
+# 于是：converter(第 38 行) → admin → admin.backend → converter(第 114 行还没跑到)
+# → `BACKEND` 尚未定义 → ImportError: partially initialized module。
+#
+# 两个后果，都真实存在过：
+#   * `import converter` 单独跑必失败（1.0.1 起就如此）—— 意味着任何把
+#     converter 当独立模块加载的场景（排查脚本、单元测试、pyinstaller 的
+#     不同入口顺序）都会炸；
+#   * 服务本身不炸，纯粹是因为 `main.py` 恰好**先** import converter、
+#     在 admin 装配前就把 BACKEND 定义好了。这种「靠调用顺序活着」的耦合
+#     迟早被某次重构打破。
+#
+# 修法：把这条 admin 依赖挪到 `BACKEND` 等常量定义**之后**（见文件末尾的
+# 延迟导入）。`UpstreamError` 只在请求处理路径上用到，不需要在导入期就有。
+def _upstream_error():
+    """延迟取 `admin.upstream_errors.UpstreamError`。
+
+    调用点在运行期（请求处理），那时 `admin` 早已初始化完成，不会有
+    部分初始化问题。返回类本身，供 except 子句与抛出处使用。
+    """
+    from admin.upstream_errors import UpstreamError
+    return UpstreamError
+
+
+def __getattr__(name: str):
+    """模块级按需属性（PEP 562）。
+
+    只服务一个符号：`UpstreamError`。它在导入期**不能**直接绑定（那会把
+    `admin` 包提前拉起来，见上面的循环导入说明），但外部代码——
+    测试、排障脚本、将来可能的第三方集成——一直把它当
+    `converter.UpstreamError` 用。用 `__getattr__` 保住这个名字的可用性，
+    同时把真正的导入推迟到第一次访问时。
+
+    找不到别的名字时抛标准 AttributeError，不要静默返回 None ——
+    那会让 `hasattr` 判断和拼写错误都变成「看起来存在」。
+    """
+    if name == "UpstreamError":
+        value = _upstream_error()
+        # 绑定到模块字典：后续访问走正常属性查找，不再进本函数。
+        globals()["UpstreamError"] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+class CredentialError(RuntimeError):
+    """Invalid local credentials; fixed messages contain no token values."""
+
+
+#: 平台后端基址。
+#:
+#: **必须定义在 `CredentialManager` 与 `CredentialError` 之后**（这里是文件
+#: 靠前的位置，两者都已经在下面定义完成 —— 见循环导入说明）：
+#: `admin.platform.workbuddy.core.backend` 在导入期就 `from converter import
+#: BACKEND, CredentialError, CredentialManager`，而这条导入链可能由
+#: `import converter` 自身触发（converter → admin 包 → admin.backend → 回来）。
+#: 三个符号谁晚定义，谁就是 ImportError 的现场。
+BACKEND = "https://copilot.tencent.com"
+DEFAULT_DOMAIN = "www.codebuddy.cn"
 
 
 def _stream_timeout() -> httpx.Timeout:
@@ -112,8 +190,7 @@ from anthropic_adapter import (
 # 常量
 # ---------------------------------------------------------------------------
 
-BACKEND = "https://copilot.tencent.com"
-DEFAULT_DOMAIN = "www.codebuddy.cn"
+# BACKEND / DEFAULT_DOMAIN 已提前到文件头部（循环导入需要，见那里的说明）。
 #: 出站 User-Agent：客户端档案中有明确来源时才使用。
 #: 不生成随机 UA，也不把服务器的运行时信息冒充成桌面客户端。
 #: 形状对齐官方桌面端三段式：`WorkBuddy/<客户端版本> WorkBuddy/<版本> CLI/<CLI版本>`。
@@ -222,9 +299,6 @@ def _get_turing_device_token() -> str | None:
     """
     return None
 
-class CredentialError(RuntimeError):
-    """Invalid local credentials; fixed messages contain no token values."""
-
 
 class CredentialManager:
     """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。"""
@@ -307,8 +381,30 @@ class CredentialManager:
         # 提前 60s 判定过期
         return time.time() * 1000 >= (expires_at - 60_000)
 
-    def _refresh(self):
-        """调后端刷新 token，写回 auth 文件与缓存。"""
+    #: 刷新响应里若缺这些字段，就从旧凭证继承。
+    #:
+    #: 实测（2026-11-02）当前上游会把 10 个字段全都回传，所以这条合并逻辑
+    #: 眼下是空转；它存在是为了**上游哪天少回一个字段时不要静默丢数据**。
+    #: 原实现用 `s["auth"] = dict(payload)` 整体覆盖，只要上游少给
+    #: `sessionState` / `tokenType` / `scope` / `domain` 中的任何一个，
+    #: 凭证就会变成「能过自检、但下游按字段读的地方拿到空值」的半残状态，
+    #: 而且没有任何报错 —— 这类静默降级在号池里最难查。
+    _INHERIT_FIELDS = (
+        'sessionState', 'tokenType', 'domain', 'scope',
+        'enterpriseId', 'expiresIn', 'refreshExpiresIn',
+    )
+
+    def _refresh(self) -> dict:
+        """调后端刷新 token，写回 auth 文件与缓存。
+
+        为什么不走 Keycloak 标准端点、也不需要 `client_secret`：
+        插件用的是自家 `/v2/plugin/auth/token/refresh`，鉴权凭据就是
+        `X-Refresh-Token` 这一个请求头。实测三种 accessToken 状态
+        （有效 / 已过期且签名伪造 / 完全不传 Authorization）**都返回 200
+        并换回新令牌** —— 所以「access 过期只能重新登录」不成立。
+
+        返回值：刷新后的 `auth` dict（便于调用方记录轮换前后的差异）。
+        """
         s = self._session()
         auth = self._validate_auth(s)
         headers = self._build_headers_from(auth, s.get("account") or {})
@@ -316,7 +412,8 @@ class CredentialManager:
         headers["X-Auth-Refresh-Source"] = "plugin"
         url = f"{BACKEND}/v2/plugin/auth/token/refresh"
         try:
-            with httpx.Client(timeout=15, limits=_HTTP_LIMITS, trust_env=settings.UPSTREAM_TRUST_ENV) as c:
+            with httpx.Client(timeout=15, limits=_HTTP_LIMITS,
+                              trust_env=_upstream_trust_env()) as c:
                 r = c.post(url, headers=headers, json={})
             data = r.json()
         except Exception as e:
@@ -327,16 +424,16 @@ class CredentialManager:
         if not isinstance(payload, dict):
             raise CredentialError('刷新令牌返回了无效凭证，已保留原凭证，请稍后重试或授权登录')
         new_auth = dict(payload)
-        # Upstream may retain the refresh token instead of rotating it. Never
-        # replace a usable stored credential with a partial successful payload.
-        if 'refreshToken' not in new_auth:
-            new_auth['refreshToken'] = auth['refreshToken']
+        # Upstream rotates the refresh token on every call, but a lenient
+        # rotation means the previous value keeps working until its own
+        # deadline. Still never let an empty/absent field erase a usable one.
+        for name in self._INHERIT_FIELDS:
+            if not new_auth.get(name) and auth.get(name):
+                new_auth[name] = auth[name]
         try:
             self._validate_auth({'auth': new_auth})
         except CredentialError:
             raise CredentialError('刷新令牌返回了不完整凭证，已保留原凭证，请稍后重试或授权登录') from None
-        # 继承部分字段
-        new_auth["domain"] = new_auth.get("domain") or auth.get("domain")
         new_auth["lastRefreshTime"] = int(time.time() * 1000)
         # 计算 expiresAt（若后端没直接给）
         if not new_auth.get("expiresAt") and new_auth.get("expiresIn"):
@@ -346,7 +443,7 @@ class CredentialManager:
         s["auth"] = new_auth
         if self.path is None:
             self._cached = s
-            return
+            return new_auth
         # 原子写回
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -354,6 +451,21 @@ class CredentialManager:
         os.replace(tmp, self.path)
         self._cached = s
         self._mtime = self.path.stat().st_mtime
+        return new_auth
+
+    def refresh_in_place(self) -> str:
+        """刷新并返回**可落库**的完整凭证 JSON（DB-backed 会话专用）。
+
+        存在的理由：刷新会轮换 refreshToken，而号池把凭证存在
+        `accounts.auth_json` 里。调用方必须在同一把锁里拿到「刷新后的整份
+        JSON」并立刻写回，否则库里留着上一代的 refreshToken。
+        实测旧的 refreshToken 在轮换后仍可重放，所以漏写不会当场废号 ——
+        但它会让「下一代会话」从更早的时间线起步，窗口一天天缩水，
+        表现就是「明明每天保活，refresh 窗口却越来越短」。
+        """
+        with self._lock:
+            self._refresh()
+            return self.export_json()
 
     def _build_headers_from(self, auth: dict, account: dict) -> dict:
         self._validate_auth({'auth': auth})
@@ -369,7 +481,8 @@ class CredentialManager:
         }
         # 企业账号才发归属头：官方只在 enterpriseId 非空时设置它们，
         # 个人账号请求里根本没有这两个头（发空值反而是特征）。
-        enterprise = str(account.get("enterpriseId") or "").strip()
+        enterprise = str(account.get("enterpriseId")
+                         or account.get("enterprise_id") or "").strip()
         if enterprise:
             h["X-Enterprise-Id"] = enterprise
             h["X-Tenant-Id"] = enterprise
@@ -484,7 +597,7 @@ class CredentialManager:
     def _request_backend(self, method: str, path: str, json_body: dict | None = None) -> dict:
         """向后端发一个同步请求，返回 {code, msg, requestId, data} 或抛异常。"""
         url = f"{BACKEND}{path}"
-        client_options = {'trust_env': settings.UPSTREAM_TRUST_ENV}
+        client_options = {}
         request_options = {}
         timeout = 15
         if os.getenv("WORKBUDDY_ANDROID") == "1":
@@ -500,20 +613,21 @@ class CredentialManager:
         extra_headers = {}
 
         try:
-            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS, **client_options) as c:
+            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS,
+                              trust_env=_upstream_trust_env(), **client_options) as c:
                 r = self._request_with_refresh(
                     c, method, url, headers, extra=extra_headers,
                     json_body=json_body, request_options=request_options)
         except Exception as e:
             raise RuntimeError(f"后端请求网络失败 {method} {path}: {e}")
         if r.status_code != 200:
-            raise UpstreamError(f"后端请求失败 {method} {path}", r.status_code, r.text)
+            raise _upstream_error()(f"后端请求失败 {method} {path}", r.status_code, r.text)
         try:
             data = r.json()
         except Exception as e:
-            raise UpstreamError(f"后端返回非 JSON {method} {path}", r.status_code, r.text) from e
+            raise _upstream_error()(f"后端返回非 JSON {method} {path}", r.status_code, r.text) from e
         if not isinstance(data, dict) or data.get("code") != 0:
-            raise UpstreamError(f"后端请求失败 {method} {path}", r.status_code, r.text)
+            raise _upstream_error()(f"后端请求失败 {method} {path}", r.status_code, r.text)
         return data
 
     def _request_backend_soft(self, method: str, path: str, json_body: dict | None = None) -> dict:
@@ -525,7 +639,8 @@ class CredentialManager:
         headers = self.get_headers()
         url = f"{BACKEND}{path}"
         try:
-            with httpx.Client(timeout=15, limits=_HTTP_LIMITS, trust_env=settings.UPSTREAM_TRUST_ENV) as c:
+            with httpx.Client(timeout=15, limits=_HTTP_LIMITS,
+                              trust_env=_upstream_trust_env()) as c:
                 r = self._request_with_refresh(
                     c, method, url, headers, json_body=json_body)
         except Exception as e:
@@ -533,7 +648,80 @@ class CredentialManager:
         try:
             return r.json()
         except Exception as e:
-            raise UpstreamError(f"后端返回非 JSON {method} {path}", r.status_code, r.text) from e
+            raise _upstream_error()(f"后端返回非 JSON {method} {path}", r.status_code, r.text) from e
+
+    def ensure_enterprise_id(self, enterprise_id: str) -> None:
+        """把落库的企业 ID 补进会话。
+
+        为什么需要：客户端 `.info` 里通常带 `account.enterpriseId`，但手工
+        导入 / 旧版本凭证可能只有 uid。缺了它 `is_enterprise()` 会判成个人版，
+        于是去调个人积分接口、拿到空结果 —— 表现就是「企业号积分恒为 0」。
+        以库里的 `accounts.enterprise_id` 为准补一次，并随 `export_json()`
+        一起回写，后续所有请求（含 X-Enterprise-Id 头）都正确。
+        """
+        eid = str(enterprise_id or "").strip()
+        if not eid:
+            return
+        with self._lock:
+            session = self._session()
+            acct = session.setdefault("account", {})
+            if str(acct.get("enterpriseId") or "").strip() == eid:
+                return
+            acct["enterpriseId"] = eid
+
+    def is_enterprise(self) -> bool:
+        """是否企业版账号。
+
+        判据与官方客户端完全一致（`isEnterpriseAccount`）：
+        `account.enterpriseId` 非空即是企业版。个人版请求里根本没有这个字段。
+        """
+        s = self._session()
+        acct = s.get("account") or {}
+        eid = acct.get("enterpriseId") or acct.get("enterprise_id") or ""
+        return bool(str(eid).strip())
+
+    def fetch_enterprise_usage(self) -> dict | None:
+        """企业版周期额度（官方 `getEnterpriseUsage` 的同构实现）。
+
+        为什么必须单独一个接口：企业账号打个人的
+        `/get-user-resource-{summary,paid,free}` 会返回空的 Accounts，
+        于是积分恒为 0 —— 但请求照常可用，账单也照常扣。官方客户端在
+        `enterpriseId` 非空时**根本不走**个人那套，改打：
+
+            POST /v2/billing/meter/get-enterprise-user-usage
+            headers: X-Enterprise-Id / X-Tenant-Id（见 _build_headers_from）
+
+        响应 `{limitNum, credit, cycleResetTime}`：
+            limitNum = 本周期总额度（-1 表示不限）
+            credit   = **已消耗**（不是剩余）
+            remain   = limitNum - credit
+
+        取不到（网络/权限/非企业凭证）返回 None，调用方回落到个人口径。
+        """
+        try:
+            data = self._request_backend(
+                "POST", "/v2/billing/meter/get-enterprise-user-usage", {})
+        except Exception:
+            return None
+        node = data.get("data") or {}
+        if isinstance(node.get("data"), dict):
+            node = node["data"]
+        if not isinstance(node, dict):
+            return None
+        limit = node.get("limitNum")
+        if not isinstance(limit, (int, float)):
+            return None
+        used = node.get("credit")
+        used = float(used) if isinstance(used, (int, float)) else 0.0
+        limit = float(limit)
+        unlimited = limit < 0
+        return {
+            "limit": None if unlimited else limit,
+            "used": used,
+            "remain": 0.0 if unlimited else max(0.0, limit - used),
+            "unlimited": unlimited,
+            "reset_at": node.get("cycleResetTime") or node.get("cycleResetTimeStr") or "",
+        }
 
     def _enterprise_path_key(self) -> str:
         """返回模型列表 endpoint 里的 enterprise 段：personal 或 enterpriseId。"""
@@ -623,7 +811,8 @@ class CredentialManager:
         headers = self.get_headers()
         url = f"{BACKEND}/v2/images/generations"
         try:
-            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS, trust_env=settings.UPSTREAM_TRUST_ENV) as c:
+            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS,
+                              trust_env=_upstream_trust_env()) as c:
                 r = self._request_with_refresh(
                     c, "POST", url, headers, json_body=body)
         except Exception as e:
@@ -643,6 +832,21 @@ class CredentialManager:
         CodeBuddy 个人体验版等一次性资源在账号层级 CapacityRemain 仍显示原始额度，
         但当期已用完后 CycleCapacityRemain 为 0；界面上的「累积剩余」也以周期剩余为准。
         """
+        # 企业版没有个人那套 Accounts 结构：先按企业口径取，
+        # 取不到再回落到个人（例如凭证其实是个人号但带了企业字段）。
+        if self.is_enterprise():
+            usage = self.fetch_enterprise_usage()
+            if usage is not None:
+                if usage["unlimited"]:
+                    # 不限额度：没有"总量/剩余"这组数字可填。
+                    # 前端会按 credits_snapshot 里的 unlimited 标记显示「不限」。
+                    return {"total": 0, "remain": 0, "unlimited": True}
+                return {
+                    "total": int(round(usage["limit"] or 0)),
+                    "remain": int(round(usage["remain"])),
+                    "used": int(round(usage["used"])),
+                    "unlimited": False,
+                }
         data = self._request_backend("POST", "/v2/billing/meter/get-user-resource", {})
         resp = data.get("data", {}).get("Response", {}).get("Data", {}) or {}
         total = 0
@@ -1126,8 +1330,7 @@ async def chat_completions(request: Request,
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     try:
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
-                                    trust_env=settings.UPSTREAM_TRUST_ENV) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
@@ -1335,8 +1538,7 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
         # 原来是 timeout=None（完全不设限）：连接一旦静默死掉就永久挂住，
         # 既不报错也不归还资源。改成静默超时 —— 有数据就续期、静默到上限才判死，
         # 等价于参考实现 internal/upstream/idle.go 的空闲监控，且不设总时长。
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
-                                    trust_env=settings.UPSTREAM_TRUST_ENV) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -1412,8 +1614,7 @@ async def _post_backend_once(url: str, headers: dict, body: dict) -> tuple[int, 
     # 这也是在消费一个 SSE 流（只是聚合成一次性字节），所以用同一套超时：
     # connect 短、read 管静默、**不设总时长**。原来的 timeout=120 会把 connect
     # 也设成 120s，遇到连不上的节点就一直挂着不换号。
-    async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
-                                trust_env=settings.UPSTREAM_TRUST_ENV) as c:
+    async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
         async with c.stream("POST", url, headers=headers, json=body) as r:
             chunks: list[bytes] = []
             async for chunk in r.aiter_bytes():
@@ -1641,8 +1842,7 @@ async def create_message(request: Request,
 
     # 非流式：聚合后端 SSE → 组装单个 Anthropic Message 对象
     try:
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
-                                    trust_env=settings.UPSTREAM_TRUST_ENV) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
             async with c.stream("POST", url, headers=headers, json=chat_body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
@@ -1712,8 +1912,7 @@ async def _stream_anthropic(url: str, headers: dict, body: dict,
         # 原来是 timeout=None（完全不设限）：连接一旦静默死掉就永久挂住，
         # 既不报错也不归还资源。改成静默超时 —— 有数据就续期、静默到上限才判死，
         # 等价于参考实现 internal/upstream/idle.go 的空闲监控，且不设总时长。
-        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS,
-                                    trust_env=settings.UPSTREAM_TRUST_ENV) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()

@@ -27,44 +27,133 @@ from admin.platform.loomy.services import scan as loomy_scan
 logger = logging.getLogger("admin.platform.loomy.platform_gateway")
 
 
+#: 一次**后台**刷新最多同步几个「积分快照已过期」的号。
+#:
+#: ⚠️ 这不再是「列表请求里同步几个」—— 那版实测把 `/accounts` 拖到 **2.8 秒**
+#: （50 个号里 8 个各要一次上游 RTT，串行）。现在列表只读快照、立刻返回，
+#: 刷新交给 `shared.kick_background_refresh()`（单飞 + 限频 + 限量）。
+QUOTA_SYNC_PER_LIST = 8
+
+#: 后台刷新的最小间隔（秒）。翻页很频繁，不能每页都排一批上游请求。
+QUOTA_REFRESH_MIN_GAP = 10.0
+
+
+def _kick_quota_refresh(account_ids: list[int]) -> bool:
+    """把「刷新过期余额」丢到后台，**不阻塞列表响应**（见 shared 里的说明）。"""
+    from admin.platform import shared
+
+    return shared.kick_background_refresh(
+        "loomy", account_ids,
+        lambda session, account: loomy_accounts.sync_quota(
+            session, account, with_models=False),
+        max_items=QUOTA_SYNC_PER_LIST, min_gap=QUOTA_REFRESH_MIN_GAP)
+
+
+def _snapshot_of(account) -> dict:
+    """账号上一次的积分快照（打上游失败时的兜底显示）。"""
+    try:
+        snap = json.loads(account.credits_snapshot or "{}")
+    except (ValueError, TypeError):
+        snap = {}
+    return snap if isinstance(snap, dict) else {}
+
+
 class LoomyAccountOps:
     """账号池 11 项操作。"""
 
     def __init__(self, realm: str = ""):
         self.realm = realm
 
-    def list(self, db):
-        """账号列表。
+    def list(self, db, *, page: int | None = None, page_size: int = 50,
+             search: str = "", status: str = "", sort: str = "id_desc",
+             min_credits=None, max_credits=None):
+        """账号列表（支持服务端分页 / 搜索 / 筛选）。
 
-        **会同步 DB 列**：admin 的 `/api/accounts` 读的是列，
-        不写回会导致前端账号池显示旧数据。
+        ## 两种模式
+
+        * `page=None`（默认）：旧行为，全量返回 —— 兼容旧调用方。
+        * `page` 传入：服务端分页。summary 走 SQL 聚合
+          （口径与全量版一致：积分类只算 active）。
+
+        ## 列表**不碰上游**
+
+        余额是展示数据，不该挡住整页渲染。这里只读 `credits_snapshot`，
+        过期账号丢给后台线程刷新（`_kick_quota_refresh`，单飞 + 限频）。
+        实测把同步探活从请求路径里拿掉后：**2.82s → 0.05s**。
+
+        搜索/筛选/排序复用 `admin.platform.shared` 的通用助手，
+        与通用 `/api/accounts` 同一套语义。
         """
-        views = []
-        for account in loomy_accounts.accounts_for(db, self.realm):
-            quota = None
+        from sqlalchemy import func as _func
+
+        from admin.models import Account
+        from admin.platform.shared import (apply_account_filters,
+                                           account_order,
+                                           summarize_accounts_sql)
+
+        query = db.query(Account).filter(Account.platform == "loomy")
+        if self.realm:
+            query = query.filter(Account.domain == self.realm)
+        query = apply_account_filters(
+            query, Account, search=search, status=status,
+            min_credits=min_credits, max_credits=max_credits)
+        query = account_order(query, Account, sort)
+
+        if page is None:
+            views, stale = self._views_of(db, query.all())
+            return {"items": views,
+                    "summary": loomy_accounts.summarize(views)}
+
+        total = int(query.with_entities(_func.count(Account.id)).scalar() or 0)
+        rows = (query.offset((max(1, page) - 1) * page_size)
+                .limit(page_size).all())
+        views, stale = self._views_of(db, rows)
+
+        # summary 不含 status 筛选（筛选 tab 显示全池分布）
+        agg_q = db.query(Account).filter(Account.platform == "loomy")
+        if self.realm:
+            agg_q = agg_q.filter(Account.domain == self.realm)
+        agg_q = apply_account_filters(
+            agg_q, Account, search=search, status="",
+            min_credits=min_credits, max_credits=max_credits)
+        return {"items": views,
+                "summary": summarize_accounts_sql(agg_q, Account),
+                "paginated": True, "total": total,
+                "page": max(1, page), "page_size": page_size}
+
+    def _views_of(self, db, accounts) -> tuple[list[dict], list[int]]:
+        """把账号列表转成视图，**只读快照、绝不打上游**。
+
+        返回 `(views, stale_ids)`；`stale_ids` 交给 `_kick_quota_refresh()`
+        在后台刷新。这里一个 HTTP 都不发 —— 实测原来同步跑 8 个号要 2.8 秒，
+        现在整个列表 0.05 秒。
+
+        ⚠️ `credits_snapshot` 解析失败必须兜住：一个坏行不能让整页 500。
+        """
+        views: list[dict] = []
+        stale: list[int] = []
+        for account in accounts:
             if not loomy_accounts.quota_is_fresh(account):
-                # 用 sync_quota 而不是 fetch_quota ——
-                # 前者**同时**拉积分余额与模型数（fetch_quota 只探模型，
-                # 用它会导致余额永远显示 0）
-                result = loomy_accounts.sync_quota(db, account)
-                if result.get("ok"):
-                    quota = result.get("quota")
-            else:
-                try:
-                    snap = json.loads(account.credits_snapshot or "{}")
-                except ValueError:
-                    snap = {}
-                quota = snap if isinstance(snap, dict) else None
-            views.append(loomy_accounts.public_view(account, quota=quota))
-        db.commit()
-        return {"items": views, "summary": loomy_accounts.summarize(views)}
+                stale.append(int(account.id or 0))
+            views.append(loomy_accounts.public_view(
+                account, quota=_snapshot_of(account)))
+        # 过期余额交给后台刷（单飞 + 限频），页面不等它。
+        try:
+            _kick_quota_refresh(stale)
+        except Exception:  # noqa: BLE001 - 后台调度失败不影响列表
+            logger.debug("后台刷新调度失败", exc_info=True)
+        return views, stale
 
     def scan(self):
         return loomy_scan.discover()
 
-    def import_local(self, db):
-        """本机导入 —— **Loomy 的主路径**（明文 JSON，用户零操作）。"""
-        return loomy_accounts.import_from_local(db)
+    def import_local(self, db, uids: list[str] | None = None):
+        """本机导入 —— **Loomy 的主路径**。
+
+        uids：前端「扫描 → 勾选 → 确认」里用户明确选中的账号；
+        None = 全部导入（兼容定时任务等老调用方）。
+        """
+        return loomy_accounts.import_from_local(db, uids=uids)
 
     def import_record(self, db, record):
         return loomy_accounts.import_record(db, record)
@@ -216,8 +305,8 @@ class LoomyClientProbe:
         from admin.platform.loomy.core import paths as _paths
 
         return enrich(result,
-                      exe_candidates=_paths.APP_EXE_CANDIDATES,
-                      data_dirs=_paths.DATA_DIR_CANDIDATES,
+                      exe_candidates=_paths.app_exe_candidates(),
+                      data_dirs=_paths.data_dir_candidates(),
                       product=_paths.UA_PRODUCT)
 
 

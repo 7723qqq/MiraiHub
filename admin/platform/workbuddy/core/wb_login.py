@@ -72,8 +72,6 @@ from typing import Any
 
 import httpx
 
-from admin.config import settings
-
 _logger = logging.getLogger("admin.wb_login")
 
 # ---------------------------------------------------------------------------
@@ -503,10 +501,10 @@ def get_session(sid: str) -> PhoneLoginSession:
 
 
 def _new_session() -> PhoneLoginSession:
+    from admin.upstream_http import ssl_context, upstream_trust_env
     client = httpx.Client(
         headers={"User-Agent": WEB_UA, "Accept-Language": "zh-CN,zh;q=0.9"},
         follow_redirects=False,
-        trust_env=settings.UPSTREAM_TRUST_ENV,
         # 分级超时：连接 5s / 读 10s / 写 10s / 池等待 5s。
         # 池等待也设上限 —— 否则连接池被占满时请求会**无限等**，
         # 那比直接失败更糟（线程一直挂着）。
@@ -517,6 +515,8 @@ def _new_session() -> PhoneLoginSession:
         # 总 fd 占用（500 会话 × 10 = 5000 fd，很容易撞 ulimit）。
         limits=httpx.Limits(max_connections=4, max_keepalive_connections=2,
                             keepalive_expiry=30.0),
+        # 上游请求直连、不继承系统代理（躲开加速器 TLS 中间人，见 issue #5）。
+        verify=ssl_context(), trust_env=upstream_trust_env(),
     )
     sid = uuid.uuid4().hex
     return PhoneLoginSession(sid=sid, client=client)
@@ -1183,11 +1183,12 @@ def fetch_credential_by_state(state: str) -> dict | None:
     # 一个请求占一个名额，而不是每次上游调用都占 —— 避免嵌套获取名额导致
     # 可用容量被腰斩，也更容易推理「同时在途的登录请求数」。
     try:
+        from admin.upstream_http import ssl_context, upstream_trust_env
         with httpx.Client(
                 headers={"User-Agent": WEB_UA},
                 timeout=httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT,
                                       pool=HTTP_CONNECT_TIMEOUT),
-                trust_env=settings.UPSTREAM_TRUST_ENV) as c:
+                verify=ssl_context(), trust_env=upstream_trust_env()) as c:
             r = c.get(f"{HOST}/v2/plugin/auth/token", params={"state": state},
                       headers={"Accept": "application/json, text/plain, */*",
                                "X-No-Authorization": "true"})
@@ -1223,10 +1224,11 @@ def build_credential_from_token(token: dict) -> tuple[str, dict]:
     domain = token.get("domain") or urllib.parse.urlparse(HOST).netloc
     account: dict = {}
     try:
+        from admin.upstream_http import ssl_context, upstream_trust_env
         with httpx.Client(headers={"User-Agent": WEB_UA},
                           timeout=httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT,
                                                 pool=HTTP_CONNECT_TIMEOUT),
-                          trust_env=settings.UPSTREAM_TRUST_ENV) as c:
+                          verify=ssl_context(), trust_env=upstream_trust_env()) as c:
             r = c.get(
                 f"{HOST}/v2/plugin/accounts",
                 headers={"Accept": "application/json, text/plain, */*",

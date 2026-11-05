@@ -21,6 +21,12 @@ if os.getenv("WORKBUDDY_DESKTOP") != "1" and os.getenv("WORKBUDDY_ANDROID") != "
 
 _logger = logging.getLogger(__name__)
 
+#: 运行环境。**必须在所有默认值之前读出来** —— 下面好几项默认值要按环境分叉。
+#:   prod / staging / dev，写错任何一个都按 dev 处理会在生产留下开发面，
+#:   所以 `admin/env_guard.py` 会在启动时再断言一次。
+_APP_ENV = (os.getenv("APP_ENV", "dev") or "dev").strip().lower()
+_IS_PROD = _APP_ENV == "prod"
+
 
 class Settings:
     LOG_REQUEST_PAYLOAD = os.getenv("ADMIN_LOG_REQUEST_PAYLOAD", "0") == "1"
@@ -44,8 +50,19 @@ class Settings:
     # 不会让吞吐变差，只会让慢请求有机会跑完。
     GATEWAY_REQUEST_TIMEOUT = max(1.0, min(900.0, float(os.getenv("ADMIN_GATEWAY_REQUEST_TIMEOUT", "300"))))
     JOIN_MAX_CONCURRENT = max(1, int(os.getenv("ADMIN_JOIN_MAX_CONCURRENT", "4")))
-    GATEWAY_RATE_PER_MINUTE = int(os.getenv("ADMIN_GATEWAY_RATE_PER_MINUTE", "60"))
-    GATEWAY_MAX_CONCURRENT = int(os.getenv("ADMIN_GATEWAY_MAX_CONCURRENT", "4"))
+    # 每个 Key 的每分钟请求数 / 同时在途数（Key 上填了值就以 Key 为准）。
+    #
+    # 2026-11-04 实测（单 Key，逐档加压，5 个平台 × 1~32 并发）：
+    #   · 默认 60/分钟会让 16 并发被**匀速放行**：Loomy 的 TTFT 从 1.6s
+    #     一路涨到 21.9s，看起来像"上游扛不住"，实际是准入层在排队；
+    #   · WorkBuddy 32 并发：TTFT 7.0s、TPS 49.7，与 1 并发的 4.6s/46.9
+    #     基本持平 —— 说明池子够大时并发可以拉满；
+    #   · Qoder 1~2 并发：TTFT 1.0~1.2s、TPS 175~193，余量充足。
+    #
+    # 所以默认放到 300/分钟 + 24 并发：够 agent 的工具循环跑，又不会在
+    # 单号池上瞬间打爆上游（每号在途上限 3 才是真正的背压）。
+    GATEWAY_RATE_PER_MINUTE = int(os.getenv("ADMIN_GATEWAY_RATE_PER_MINUTE", "300"))
+    GATEWAY_MAX_CONCURRENT = int(os.getenv("ADMIN_GATEWAY_MAX_CONCURRENT", "24"))
     GATEWAY_LIMIT_BACKEND = os.getenv("ADMIN_GATEWAY_LIMIT_BACKEND", "auto").lower()
     # Per-upstream-account start pacing is independent of per-key concurrency/RPM.
     UPSTREAM_START_INTERVAL_MS = int(os.getenv("ADMIN_UPSTREAM_START_INTERVAL_MS", "75"))
@@ -86,10 +103,49 @@ class Settings:
         _logger.warning("ADMIN_JWT_SECRET 未设置，使用开发弱密钥；生产环境请在 .env 中配置")
         _jwt = "dev-insecure-jwt-secret-change-me"
     JWT_SECRET = _jwt
-    JWT_EXPIRE_HOURS = int(os.getenv("ADMIN_JWT_EXPIRE_HOURS", "24"))
+    # 后台会话有效期（小时）。
+    #
+    # 2026-11-05 从 24 收到 4：令牌即便只存在 HttpOnly Cookie 里，被偷一次
+    # 也意味着 24 小时的全量号池访问权。4 小时足够一次运维班次，超出就重登。
+    # 生产启动断言另有一条「<= 8」的硬上限（见 admin/env_guard.py）。
+    JWT_EXPIRE_HOURS = int(os.getenv("ADMIN_JWT_EXPIRE_HOURS", "4"))
 
-    # 服务监听
-    HOST = os.getenv("ADMIN_HOST", "0.0.0.0")
+    # ---------- 后台会话策略（2026-11-05 加固） ----------
+    #: 是否开启「同一账号只允许一个有效会话」。
+    #:
+    #: 开启后：每次登录都会**吊销此前签发的全部会话**，旧标签页/旧设备立刻失效。
+    #: 这是「同一个凭证只能一个人用」的落点 —— 凭证本身不再是一张可以复制
+    #: 传播的长期票据，而是一条绑定到具体会话行的记录。
+    SESSION_SINGLE = os.getenv("ADMIN_SESSION_SINGLE", "1") != "0"
+    #: 是否把会话绑定到设备标识 Cookie（`wb_device`）。
+    #:
+    #: 换浏览器/清 Cookie 后必须重新登录；把 `admin_session` 复制到另一台
+    #: 浏览器也过不了校验。CLI 走 `X-Admin-Token` 头时不做该绑定。
+    SESSION_BIND_DEVICE = os.getenv("ADMIN_SESSION_BIND_DEVICE", "1") != "0"
+    #: 设备标识 Cookie 有效期（天）。只用于绑定，不承载任何权限。
+    DEVICE_COOKIE_DAYS = int(os.getenv("ADMIN_DEVICE_COOKIE_DAYS", "180"))
+    #: 是否强制 CSRF 双提交校验（Cookie 鉴权的写操作）。
+    CSRF_ENABLED = os.getenv("ADMIN_CSRF_ENABLED", "1") != "0"
+
+    #: join 访问票据签名密钥。生产必须独立配置，**不要**复用 ADMIN_JWT_SECRET：
+    #: 两者生命周期不同（票据 15 分钟、会话 4 小时），共用一把钥匙意味着
+    #: 任一泄露点都会同时打穿两个体系。
+    JOIN_TICKET_SECRET = os.getenv("JOIN_TICKET_SECRET", "")
+    #: join 访问票据 TTL（秒）。
+    #:
+    #: 2026-11-05 从 15 分钟放宽到 24 小时：票据不再是"一次性"，而是
+    #: **有效期内可重复打开**。15 分钟对"发给朋友、对方晚点再点"太苛刻，
+    #: 实际使用中只会逼着管理员反复签发。安全性由「总闸 + 代次 + 短码不可猜」
+    #: 保证：关闸或再开闸都会让旧链接全部失效。
+    JOIN_TICKET_TTL = max(60, min(7 * 86400, int(os.getenv("JOIN_TICKET_TTL", "86400"))))
+    #: 票据换来的访问 Cookie TTL（秒）。过期后重新点一次链接即可。
+    JOIN_ACCESS_TTL = max(60, min(24 * 3600, int(os.getenv("JOIN_ACCESS_TTL", "14400"))))
+
+    # 服务监听。
+    #
+    # 生产默认 127.0.0.1：8790 只允许 nginx 反代进来，不做公网直连。
+    # 本地/桌面/安卓仍默认 0.0.0.0（客户端从本机访问，且需要局域网调试）。
+    HOST = os.getenv("ADMIN_HOST", "127.0.0.1" if _IS_PROD else "0.0.0.0")
     PORT = int(os.getenv("ADMIN_PORT", "8790"))
     # Only these direct peers may supply X-Real-IP / X-Forwarded-For.
     TRUSTED_PROXY_IPS = os.getenv("ADMIN_TRUSTED_PROXY_IPS", "127.0.0.1,::1")
@@ -132,14 +188,8 @@ class Settings:
     # 所以默认一律不发；仅当运维显式配置头名时才发送该头。
     UPSTREAM_CLIENT_HEADER = os.getenv("ADMIN_UPSTREAM_CLIENT_HEADER", "")
 
-    #: 上游请求是否继承本机系统代理（HTTP_PROXY / HTTPS_PROXY / Windows 注册表代理）。
-    #:
-    #: 默认**不继承**。本机开着第三方加速器（如 Steam++）时，它会做 TLS 中间人
-    #: 并换发自签根证书；httpx 一旦继承系统代理，所有上游调用都会
-    #: CERTIFICATE_VERIFY_FAILED —— 表现为账号刷新/模型同步全部失败、
-    #: 桌面端报「本地服务启动超时」。确实需要经代理出网时才置
-    #: ADMIN_UPSTREAM_TRUST_ENV=1。
-    UPSTREAM_TRUST_ENV = os.getenv("ADMIN_UPSTREAM_TRUST_ENV", "0") == "1"
+    # 上游请求是否继承系统代理由 admin.upstream_http.upstream_trust_env() 统一读取
+    # ADMIN_UPSTREAM_TRUST_ENV（默认不继承），此处不再重复定义，避免两处口径不一致。
 
     # 上游请求用量「client」列显示的产品名。
     # 腾讯 CodeBuddy/WorkBuddy 后端通过 X-IDE-Name 头识别客户端，默认 "WorkBuddy"。
@@ -153,9 +203,10 @@ class Settings:
     #: 逆向产物（客户端源码）管理：后台一键拆包 app.asar、手动指定安装目录。
     #:
     #: **只对开发/测试环境有意义**：生产服务器既没有客户端安装包，也不该在上面
-    #: 放 225MB 的源码。默认开启（本地开发方便），生产部署设为 0 即可整体关闭
-    #: —— 关闭后 /api/app-source/* 全部返回 404，后台也不显示该区域。
-    DEV_TOOLS = os.getenv("ADMIN_DEV_TOOLS", "1") != "0"
+    #: 放 225MB 的源码。默认开启（本地开发方便），生产部署**默认关闭**，
+    #: 且 `admin/env_guard.py` 会在 APP_ENV=prod 时对 1 直接拒绝启动。
+    #: 关闭后 /api/app-source/* 全部返回 404，后台也不显示该区域。
+    DEV_TOOLS = os.getenv("ADMIN_DEV_TOOLS", "0" if _IS_PROD else "1") != "0"
 
     # ---------- 流量治理（限流 / 并发 / 保活） ----------
     #: 单账号最大在途请求数（0 = 不限）。
@@ -219,6 +270,17 @@ class Settings:
     KEEPALIVE_ENABLED = os.getenv("ADMIN_KEEPALIVE_ENABLED", "1") != "0"
     #: 保活/批量任务里账号之间的最小间隔（秒），避免批量请求被识别为机器行为。
     KEEPALIVE_ACCOUNT_GAP = float(os.getenv("ADMIN_KEEPALIVE_ACCOUNT_GAP", "0.8"))
+    #: 续期窗口兜底刷新（秒）。0 表示关闭这个兜底。
+    #:
+    #: 存在理由：保活是「每天一个整点」的预设节奏，只要那一刻服务不在线
+    #: （重启、部署、断电），当天就整轮错过。一次两次无所谓 —— refresh 窗口
+    #: 有 60 天，但旧机制确实能积压出「连续 18 天没跑过」。这个兜底把
+    #: 「整点错过」降级成「最多晚 N 秒」，不再依赖保活的准点性。
+    #:
+    #: 默认 6 小时：与 `admin/token_expiry.py` 的 RENEWAL_GUARD_DAYS=14 配合，
+    #: 死亡线前的后半程有几十次补救机会。对上游负担很小 —— 每次只是把当前
+    #: refreshToken 换一份新的，与官方客户端 24h 一次的节奏同量级。
+    RENEWAL_SWEEP_SECONDS = int(os.getenv("ADMIN_RENEWAL_SWEEP_SECONDS", "21600"))
 
     # ---------- 上游阶段超时（另有 300 秒的网关总时限） ----------
     #: 连接超时（秒）：连不上就快速换号，不让用户干等。
@@ -232,7 +294,9 @@ class Settings:
     #: Trae 的 `_timeout()` 直接读这个值去连上游，之前 180 < 300，
     #: 推理型模型思考到 200 秒就被上游读超时打断，而网关还以为是正常结束。
     #: 现在统一到 300，两边口径一致。
-    STREAM_IDLE_TIMEOUT = float(os.getenv("ADMIN_STREAM_IDLE_TIMEOUT", "300"))
+    # 600s：这是**帧间隔/静默**上限，不是请求总时长。深度思考模型静默
+    # 3~4 分钟属正常工作状态，不能被网关掐断（用户实测反馈）。
+    STREAM_IDLE_TIMEOUT = float(os.getenv("ADMIN_STREAM_IDLE_TIMEOUT", "600"))
     #: 写入（上传 prompt）超时（秒）。
     STREAM_WRITE_TIMEOUT = float(os.getenv("ADMIN_STREAM_WRITE_TIMEOUT", "60"))
     #: 连接池等待超时（秒）：池子饱和就快速失败，交给上层退避，而不是无限排队。

@@ -45,8 +45,10 @@
     return (window.WBPlatformIcons && window.WBPlatformIcons.get(id)) || "";
   }
 
+  /* 凭证走 HttpOnly Cookie，这里不再读取任何令牌。
+   * 保留同名函数是为了让调用点保持"显式声明鉴权意图"的可读性。 */
   function storedToken() {
-    return window.TOKEN || localStorage.getItem("wb_admin_token") || "";
+    return "";
   }
 
   function saved() {
@@ -251,7 +253,7 @@ function actionsFor(spec) {
       render();
       return Promise.resolve(state);
     }
-    return fetch("/api/platforms", { headers: { "X-Admin-Token": storedToken() } })
+    return fetch("/api/platforms", { credentials: "same-origin" })
       .then(function (res) { return res.ok ? res.json() : null; })
       .then(function (data) {
         if (data && data.items && data.items.length) {
@@ -271,15 +273,28 @@ function actionsFor(spec) {
 
   function bind() {
     var panel = $("#platformSwitch");
-    if (!panel || panel.dataset.bound === "1") return;
-    panel.dataset.bound = "1";
-    panel.addEventListener("click", function (event) {
-      var card = event.target.closest("[data-platform]");
-      if (card) { select(card.dataset.platform); return; }
-      var realm = event.target.closest("[data-realm]");
-      if (realm) { select(state.platform, realm.dataset.realm); return; }
-      var action = event.target.closest("[data-platform-action]");
-      if (action) { window.WBPlatform.action(action.dataset.platformAction); }
+
+    // The action toolbar lives in the panel header, outside #platformSwitch.
+    // Keep the two delegated listeners independent: returning early because
+    // the card switcher is already bound must not leave the toolbar inert.
+    if (panel && panel.dataset.bound !== "1") {
+      panel.dataset.bound = "1";
+      panel.addEventListener("click", function (event) {
+        var card = event.target.closest("[data-platform]");
+        if (card) { select(card.dataset.platform); return; }
+        var realm = event.target.closest("[data-realm]");
+        if (realm) { select(state.platform, realm.dataset.realm); return; }
+      });
+    }
+    [$("#platformActions"), $("#intakePlatformLogin")].forEach(function (actionHost) {
+      if (!actionHost || actionHost.dataset.bound === "1") return;
+      actionHost.dataset.bound = "1";
+      actionHost.addEventListener("click", function (event) {
+        var action = event.target.closest("[data-platform-action]");
+        if (!action) return;
+        event.preventDefault();
+        window.WBPlatform.action(action.dataset.platformAction);
+      });
     });
   }
 
@@ -306,7 +321,7 @@ function actionsFor(spec) {
     load: function () {
       if (state.busy) return Promise.resolve(state);
       state.busy = true;
-      return fetch("/api/platforms", { headers: { "X-Admin-Token": storedToken() } })
+      return fetch("/api/platforms", { credentials: "same-origin" })
         .then(function (res) { return res.ok ? res.json() : null; })
         .then(function (data) {
           state.busy = false;
@@ -331,6 +346,15 @@ function actionsFor(spec) {
     },
     current: function () { return { platform: state.platform, realm: state.realm }; },
     spec: function () { return specOf(state.platform); },
+    /**
+     * 已加载的平台清单（`/api/platforms` 的 items）。
+     *
+     * 给「把落库平台 id 翻成中文名」的场景用：实时请求行、日志、运行平台
+     * 这些地方拿到的是 `raccoon` / `qoder` 这种 id，直接显示就是英文代号，
+     * 而控制台其它地方（平台卡片、模型页）显示的是「小浣熊」——
+     * 同一个平台两种叫法，用户会以为是两个东西。
+     */
+    list: function () { return state.items || []; },
     selector: function () { return window.WBPlatform.route(); },
     onChange: function (fn) {
       if (typeof fn === "function") listeners.push(fn);

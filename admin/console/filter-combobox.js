@@ -91,8 +91,13 @@ window.WBFilterCombobox = (() => {
     const current = state.select?.selectedOptions[0]?.textContent;
     const query = (state.select && state.input.value === current ? '' : state.input.value).trim().toLocaleLowerCase();
     const label = value => state.select ? value.label : value;
-    const empty = state.select ? {value:'', label:state.select.options[0].textContent} : '';
-    state.matches = [empty, ...state.values.filter(value => label(value).toLocaleLowerCase().includes(query))];
+    // 「空值项」只有在 select 真的有 `<option value="">` 时才补。
+    // 账号池的排序 / 每页条数没有空选项，硬补一个会让用户点「最新添加」
+    // 却把 value 设成空串（后端拿不到排序），看起来像「选了没生效」。
+    const first = state.select ? state.select.options[0] : null;
+    const empty = (first && !first.value) ? { value: '', label: first.textContent } : null;
+    state.matches = [...(empty ? [empty] : []),
+                     ...state.values.filter(value => label(value).toLocaleLowerCase().includes(query))];
     state.active = -1;
     state.input.removeAttribute('aria-activedescendant');
     state.panel.replaceChildren();
@@ -133,13 +138,18 @@ window.WBFilterCombobox = (() => {
   }
   function open(state) {
     if (opened && opened !== state) close();
+    // 下拉展开瞬间先收掉悬停提示：否则鼠标还停在下拉框上，
+    // 那个 200ms 后才出现的 tooltip 正好浮在选项列表上把第一项盖住。
+    try { window.hideActionTooltip && window.hideActionTooltip(); } catch (e) {}
     opened = state; state.panel.hidden = false;
+    document.documentElement.classList.add('is-combobox-open');
     state.input.setAttribute('aria-expanded', 'true'); render(state);
   }
   function close() {
     if (!opened) return;
     opened.panel.hidden = true; opened.input.setAttribute('aria-expanded', 'false');
     opened.input.removeAttribute('aria-activedescendant'); opened = null;
+    document.documentElement.classList.remove('is-combobox-open');
   }
   document.addEventListener('pointerdown', event => {
     if (opened && !opened.wrap.contains(event.target) && !opened.panel.contains(event.target)) close();
