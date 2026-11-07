@@ -1,4 +1,5 @@
 """定时任务管理：列表 / 新增 / 修改 / 删除 / 启停 / 立即运行。"""
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -7,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from admin.db import get_db
-from admin.models import Schedule
+from admin.models import Schedule, SystemSetting
 from admin.scheduler import run_task, _dump_result, start_growth_plan
 from admin.security import require_admin, clean_display_name
 from admin.schedule_timing import ScheduleTiming, timing_of, next_run_at, cycle_label, display_name
@@ -21,7 +22,8 @@ router = APIRouter(prefix="/api/schedules", tags=["schedules"])
 #: 写死的清单会让新平台的任务永远进不了下拉框。
 TASK_CHOICES = ["refresh_balances", "refresh_credits", "sync_models", "daily_checkin",
                 "refresh_growth_tasks", "run_growth_tasks",
-                "run_growth_plan", "keepalive_tokens", "ban_recheck"]
+                "run_growth_plan", "keepalive_tokens", "ban_recheck",
+                "daily_activity"]
 
 
 def _platform_tasks() -> tuple[dict, dict]:
@@ -75,6 +77,8 @@ _TASK_FALLBACK_LABEL = {
     "loomy_keepalive": "会话保活",
     "raccoon_keepalive": "会话保活（续期临期 JWT）",
     "raccoon_expiry_sweep": "过期清扫（标记失效账号）",
+    "codearts_checkin": "签到领取权益（CodeArts）",
+    "codearts_keepalive": "会话保活（续期 STS 临时凭证）",
 }
 TASK_LABELS = {
     "refresh_balances": "刷新平台总积分",
@@ -86,6 +90,7 @@ TASK_LABELS = {
     "run_growth_plan": "WorkBuddy 成长计划巡检",
     "keepalive_tokens": "token 保活刷新",
     "ban_recheck": "风控封号复核与自动解封",
+    "daily_activity": "每日活跃对话（模拟真人使用）",
 }
 
 
@@ -134,6 +139,12 @@ class ScheduleIn(BaseModel):
     timing: Optional[ScheduleTiming] = None
     enabled: int = 1
     stop_after: Optional[str] = None  # ISO 时间字符串（daily_checkin 用）
+    # ---- 出口代理与并发（2026-11-06）----
+    # 一个出口 IP 上跑几十个号会被上游拉黑；池子几百上千时更必须分散。
+    proxy_pool: str = ""            # 用哪组代理节点（空 = 直连）
+    concurrency: int = Field(default=0, ge=0, le=64)   # 0 = 按代理槽自动
+    time_budget_minutes: int = Field(default=0, ge=0, le=720)   # 0 = 用默认
+    stale_minutes: int = Field(default=0, ge=0, le=10080)       # 0 = 用默认
 
 
 class SchedulePatch(BaseModel):
@@ -144,6 +155,10 @@ class SchedulePatch(BaseModel):
     timing: Optional[ScheduleTiming] = None
     enabled: Optional[int] = None
     stop_after: Optional[str] = None  # ISO 时间字符串（daily_checkin 用）
+    proxy_pool: Optional[str] = None
+    concurrency: Optional[int] = Field(default=None, ge=0, le=64)
+    time_budget_minutes: Optional[int] = Field(default=None, ge=0, le=720)
+    stale_minutes: Optional[int] = Field(default=None, ge=0, le=10080)
 
 
 def _normalize_platform(value: str | None) -> str:
@@ -227,26 +242,109 @@ def list_schedules(_: bool = Depends(require_admin), db: Session = Depends(get_d
             "next_run_at": s.next_run_at.isoformat() if s.next_run_at else None,
             "last_result": s.last_result or "",
             "stop_after": s.stop_after.isoformat() if s.stop_after else None,
+            # 出口代理与并发：前端要能直接看到「这条任务从哪出去、几个并发」，
+            # 否则配了代理也不知道生效没有。
+            "proxy_pool": str(getattr(s, "proxy_pool", "") or ""),
+            "concurrency": int(getattr(s, "concurrency", 0) or 0),
+            "time_budget_minutes": int(getattr(s, "time_budget_minutes", 0) or 0),
+            "stale_minutes": int(getattr(s, "stale_minutes", 0) or 0),
             "due_soon": bool(s.enabled and (s.next_run_at is None or s.next_run_at <= now)),
         }
         for s in rows
     ]}
 
 
-def _platform_label(value: str | None) -> str:
-    """落库平台 -> 展示名。
+# ---- 全局出口代理与并发（2026-11-07）----
+# 需求：定时任务页加一处「全局可生效」的出口/并发配置；单个任务上的
+# 同名配置保留不动。优先级：任务显式配置 > 全局默认 > 环境变量 > 内置默认。
+# 存 SystemSetting 单键 JSON（schedule:global_proxy），任务执行时才读，
+# 天然热生效，无需重启。
+_GLOBAL_PROXY_KEY = "schedule:global_proxy"
 
-    `trae` 是**落库平台**（对外已拆成 trae-cn / trae-intl），
-    `registry.get("trae")` 查不到，原来就回落成 "WorkBuddy" ——
-    于是 Trae 的签到任务被标成 WorkBuddy 的任务。
+
+def _global_proxy_defaults(db: Session) -> dict:
+    row = db.query(SystemSetting).filter(SystemSetting.key == _GLOBAL_PROXY_KEY).first()
+    data = {}
+    if row and row.value:
+        try:
+            data = json.loads(row.value)
+        except Exception:  # noqa: BLE001 - 坏数据按未配置处理
+            data = {}
+    return {
+        "proxy_pool": str(data.get("proxy_pool") or "").strip()[:32],
+        "concurrency": max(0, min(64, int(data.get("concurrency") or 0))),
+        "time_budget_minutes": max(0, min(720, int(data.get("time_budget_minutes") or 0))),
+        "stale_minutes": max(0, min(10080, int(data.get("stale_minutes") or 0))),
+    }
+
+
+@router.get("/global-proxy")
+def get_global_proxy(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    return _global_proxy_defaults(db)
+
+
+@router.put("/global-proxy")
+def set_global_proxy(body: SchedulePatch, _: bool = Depends(require_admin),
+                     db: Session = Depends(get_db)):
+    current = _global_proxy_defaults(db)
+    data = {
+        "proxy_pool": (str(body.proxy_pool).strip()[:32]
+                       if body.proxy_pool is not None else current["proxy_pool"]),
+        "concurrency": (max(0, min(64, int(body.concurrency)))
+                        if body.concurrency is not None else current["concurrency"]),
+        "time_budget_minutes": (max(0, min(720, int(body.time_budget_minutes)))
+                                if body.time_budget_minutes is not None
+                                else current["time_budget_minutes"]),
+        "stale_minutes": (max(0, min(10080, int(body.stale_minutes)))
+                          if body.stale_minutes is not None else current["stale_minutes"]),
+    }
+    row = db.query(SystemSetting).filter(SystemSetting.key == _GLOBAL_PROXY_KEY).first()
+    if row is None:
+        row = SystemSetting(key=_GLOBAL_PROXY_KEY)
+        db.add(row)
+    row.value = json.dumps(data, ensure_ascii=False)
+    db.commit()
+    return {"ok": True, **data}
+
+
+def _platform_label(value: str | None) -> str:
+    """任务平台 -> 展示名（**区分绑定区与双区共用**，2026-11-07）。
+
+    三种情况要分清：
+      * 区级对外 id（`qoder-intl` / `trae-cn`）→ 只跑那个区，显示区名
+        （「Qoder 国际版」）；
+      * **落库平台名**（`qoder` / `trae`）→ 调度器实例化不带区的网关，
+        **两个区都跑**（见 scheduler._platform_runner 的说明）——
+        标注成「品牌（中国版+国际版）」，否则用户以为只有中国版
+        （「定时任务里怎么没看到国际版」的疑问就是这么来的）；
+      * 单区平台（codearts / workbuddy / loomy …）→ 直接用 spec.label。
+
+    `trae` 老兜底「Trae」也并进双区分支（它本来就是双区落库平台）。
     """
     from admin.platform import registry
 
     key = str(value or "").strip().lower()
-    if key == "trae":
-        return "Trae"
-    spec = registry.get(key or registry.DEFAULT_PLATFORM)
-    return spec.label if spec else (key or "WorkBuddy")
+    if not key:
+        return "WorkBuddy"
+    spec = registry.get(key)
+    # Qoder 中国版的对外 id 就是落库名 `qoder` —— registry 会直接命中，
+    # 不能只看命中与否；storage==key 本身 = 落库平台名 → 双区标注。
+    if spec is not None and spec.storage() != key:
+        return spec.label
+    candidates = [sp for sp in registry.all_platforms()
+                  if sp.storage() == key]
+    if not candidates:
+        return key
+    if len(candidates) > 1:
+        brand = candidates[0].label
+        # 品牌名 = 区级 label 去掉区后缀（「Qoder 中国版」→「Qoder」）
+        for suffix in ("中国版", "国际版", "国内版"):
+            brand = brand.replace(" " + suffix, "").replace(suffix, "")
+        realms = " + ".join(
+            {"cn": "中国版", "intl": "国际版"}.get(sp.realm, sp.realm or "")
+            for sp in candidates)
+        return "%s（%s）" % (brand.strip(), realms)
+    return candidates[0].label
 
 
 @router.post("")
@@ -261,6 +359,10 @@ def create_schedule(body: ScheduleIn, _: bool = Depends(require_admin), db: Sess
         enabled=body.enabled,
         stop_after=_parse_stop_after(body.stop_after),
         next_run_at=datetime.utcnow(),
+        proxy_pool=str(body.proxy_pool or "").strip()[:32],
+        concurrency=max(0, min(64, int(body.concurrency or 0))),
+        time_budget_minutes=max(0, min(720, int(body.time_budget_minutes or 0))),
+        stale_minutes=max(0, min(10080, int(body.stale_minutes or 0))),
     )
     if body.timing is not None:
         _set_timing(s, body.timing)
@@ -298,6 +400,15 @@ def patch_schedule(sid: int, body: SchedulePatch, _: bool = Depends(require_admi
         s.next_run_at = next_run_at(s, datetime.utcnow())
     if "stop_after" in body.__fields_set__:
         s.stop_after = _parse_stop_after(body.stop_after)
+    # ---- 出口代理与并发 ----
+    if body.proxy_pool is not None:
+        s.proxy_pool = str(body.proxy_pool or "").strip()[:32]
+    if body.concurrency is not None:
+        s.concurrency = max(0, min(64, int(body.concurrency)))
+    if body.time_budget_minutes is not None:
+        s.time_budget_minutes = max(0, min(720, int(body.time_budget_minutes)))
+    if body.stale_minutes is not None:
+        s.stale_minutes = max(0, min(10080, int(body.stale_minutes)))
     db.commit()
     return {"id": s.id, "ok": True}
 

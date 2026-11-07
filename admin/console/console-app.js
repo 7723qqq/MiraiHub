@@ -382,6 +382,20 @@ function mobileCardsEnabled() {
   return window.matchMedia && window.matchMedia("(max-width:640px)").matches;
 }
 
+/**
+ * 移动端把表格变成卡片。
+ *
+ * 复用现有 `table.is-cards`（样式在 index.html 的 @media 里）：JS 只写
+ * `data-label` 和 `.c-title`，版式全交给 CSS —— 桌面端这些规则一条都不生效。
+ *
+ * ## 为什么模型表要单独处理
+ *
+ * 模型表的单元格不是纯文本：第一列里有厂商图标、可复制的调用名、标签行、
+ * 上下文/能力摘要；「延迟与健康」列是一个多行 grid。卡片化后这些块会被
+ * `display:flex; justify-content:space-between` 拆到左右两头，
+ * 变成截图里那种「模型名左、`4 账号` 右、中间一大片空洞」的废版。
+ * 所以给它们加 `.c-block`：整块占满一行、内部保持原来的排布。
+ */
 function applyMobileCards() {
   if (!mobileCardsEnabled()) return;
   document.querySelectorAll("table.tbl, table.acc-table").forEach(table => {
@@ -390,16 +404,53 @@ function applyMobileCards() {
     // 标题列：优先"名称 / 任务名 / 平台 / 模型 / Key"，找不到就用第一列
     let titleIdx = heads.findIndex(t => /名称|任务名|平台|模型|Key/i.test(t));
     if (titleIdx < 0) titleIdx = 0;
+    // 模型表是唯一「一格里塞好几个块」的表：平铺行有厂商图标 + 可复制 id +
+    // 标签行 + 能力摘要，聚合行有模型名 + 描述 / 平台芯片 + 复制 id。
+    // 对它额外放宽 c-block 判定（见下）；账号 / 日志表的版式已经调好，不去动。
+    const isModelTable = Boolean(table.querySelector('#modelBody'));
     table.querySelectorAll("tbody tr").forEach(tr => {
       Array.from(tr.children).forEach((td, i) => {
-        if (!td.hasAttribute("data-label")) {
-          td.setAttribute("data-label", heads[i] || "");
-        }
+        // 每次都重写：行是整块重绘的，旧标记会随旧 DOM 一起消失
+        td.setAttribute("data-label", heads[i] || "");
         td.classList.toggle("c-title", i === titleIdx);
+        // 复合内容（多个子块 / 图标 + 文本 / 进度条）整块占一行，
+        // 不要被 flex 拆到两头。
+        let rich = td.querySelector(
+          ".model-id-line, .model-call-id, .model-promotion-row, " +
+          ".model-capacity-line, .latency-cell, .model-health-cell, " +
+          ".live-request-row, .btn-row, code[data-copy-model]");
+        if (!rich && isModelTable) {
+          // 模型表里「超过一个子元素」的格子必然是复合内容
+          // （名字 + 描述 / 芯片 + 倍率 …），按整块渲染才对。
+          const kids = Array.from(td.children);
+          rich = kids.length >= 2 ? td : null;
+        }
+        td.classList.toggle("c-block", Boolean(rich));
+        // 操作列：按钮多，单独标记（CSS 里靠右换行）
+        if (i === tr.children.length - 1 && td.querySelector("button")) {
+          td.classList.add("c-ops");
+        }
       });
     });
     table.classList.add("is-cards");
+    // 卡片化之后**容器内部滚动**：手机上一屏只看得到 2~3 张卡，
+    // 几十条记录全展开会把整页拉成好几屏（用户得一直往下滑才能到分页器）。
+    // 桌面端这个 class 没有样式，不生效。
+    const box = table.parentElement;
+    if (box) box.classList.add("tbl-wrap-cards");
   });
+}
+
+/** 渲染完表格后补一次卡片标记。
+ *
+ * 为什么需要它：`applyMobileCards()` 原来只挂在 `_loadEnd()`（请求计数归零）上，
+ * 而模型页 / 日志页拿到数据后会**再重绘一次 tbody**（补健康、补描述、补繁忙）。
+ * 重绘之后表上还有 `is-cards`，但新行的 `data-label` / `c-block` 全没了 ——
+ * 表现就是「第一次进页面是卡片，翻个页/刷一下就变回挤在一起的表格」。
+ */
+function refreshMobileCardsSoon() {
+  if (!mobileCardsEnabled()) return;
+  try { applyMobileCards(); } catch (e) { /* 纯展示，不能影响渲染 */ }
 }
 
 function _loadEnd() {
@@ -586,6 +637,102 @@ async function saveRuntimeConfig() {
   } finally {
     if (status) status.textContent = "";
   }
+}
+
+/**
+ * 出口代理节点管理（设置页）。
+ *
+ * 为什么要有这个界面：一个出口 IP 上跑几十个号会被上游拉黑，而号池
+ * 几百上千时不可能全从本机一个 IP 出去。节点配好之后，定时任务里
+ * 填「分组名」就能让那个任务走代理。
+ *
+ * 列表里的 `slots` 是**真正生效的并发上限**（Σ max_concurrency），
+ * 不是节点个数 —— 这是最容易误读的地方，所以单独显示。
+ */
+async function loadProxyNodes() {
+  const host = document.getElementById("proxyNodesHost");
+  if (!host) return;
+  try {
+    const { ok, data } = await safeJson(await api("/api/proxies"));
+    if (!ok) throw new Error(data.detail || "加载失败");
+    const items = data.items || [];
+    const summary = data.summary || {};
+    if (!items.length) {
+      host.innerHTML = `<p class="fs-12" style="color:var(--fg-subtle)">还没有配置出口节点，任务会从<b>本机 IP</b> 直连。批量任务建议至少配一个。</p>`;
+      return;
+    }
+    const stateText = { ready: "可用", blocked: "静默中", disabled: "已停用" };
+    const rows = items.map(n => `<tr>
+      <td>${esc(n.label || ("#" + n.id))}</td>
+      <td class="mono fs-12" style="max-width:280px;overflow:hidden;text-overflow:ellipsis">${esc(n.url)}</td>
+      <td class="tnum text-right">${n.max_concurrency}</td>
+      <td>${esc(n.pool || "默认")}</td>
+      <td><span class="badge ${n.state === "ready" ? "badge-ok" : "badge-warn"}">${stateText[n.state] || n.state}</span></td>
+      <td class="fs-12" style="color:var(--fg-subtle)">${esc((n.last_error || "").slice(0, 40))}</td>
+      <td class="c-ops">
+        <button class="acc-op-btn" onclick="toggleProxyNode(${n.id},${n.enabled ? 0 : 1})" title="${n.enabled ? "停用" : "启用"}">${n.enabled ? "停" : "启"}</button>
+        ${n.blocked ? `<button class="acc-op-btn" onclick="unblockProxyNode(${n.id})" title="解除静默">解</button>` : ""}
+        <button class="acc-op-btn" onclick="deleteProxyNode(${n.id})" title="删除">删</button>
+      </td></tr>`).join("");
+    host.innerHTML = `
+      <p class="fs-12" style="margin-bottom:8px">
+        共 <b>${summary.total || 0}</b> 个节点，可用 <b>${summary.ready || 0}</b>，
+        静默 <b>${summary.blocked || 0}</b>，停用 <b>${summary.disabled || 0}</b>
+        · <b style="color:var(--brand)">可并发槽位 ${summary.slots || 0}</b>
+      </p>
+      <div class="tbl-wrap" style="max-height:280px;overflow:auto">
+        <table class="tbl"><thead><tr>
+          <th>名称</th><th>地址</th><th class="text-right">并发</th><th>分组</th><th>状态</th><th>最近错误</th><th></th>
+        </tr></thead><tbody>${rows}</tbody></table></div>`;
+  } catch (e) {
+    host.innerHTML = `<p class="fs-12" style="color:var(--danger)">代理节点加载失败：${esc(e.message)}</p>`;
+  }
+}
+
+async function addProxyNode() {
+  const url = ($("#proxyUrl").value || "").trim();
+  const status = $("#proxyStatus");
+  if (!url) { toast("请填写代理地址", "err"); return; }
+  status.textContent = "保存中…";
+  try {
+    const r = await api("/api/proxies", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        label: ($("#proxyLabel").value || "").trim(),
+        url,
+        max_concurrency: Math.max(1, Math.min(32, Number($("#proxyConc").value) || 1)),
+        pool: ($("#proxyPool").value || "").trim(),
+      }),
+    });
+    const { ok, data } = await safeJson(r);
+    if (!ok) throw new Error((data.detail && JSON.stringify(data.detail)) || "保存失败");
+    $("#proxyUrl").value = ""; $("#proxyLabel").value = "";
+    toast("已添加出口节点");
+    loadProxyNodes();
+  } catch (e) {
+    toast("添加失败：" + e.message, "err");
+  } finally {
+    status.textContent = "";
+  }
+}
+
+async function toggleProxyNode(id, enabled) {
+  const { ok, data } = await safeJson(await api(`/api/proxies/${id}`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  }));
+  if (ok) loadProxyNodes(); else toast(data.detail || "操作失败", "err");
+}
+
+async function unblockProxyNode(id) {
+  const { ok } = await safeJson(await api(`/api/proxies/${id}/unblock`, { method: "POST" }));
+  if (ok) { toast("已解除静默"); loadProxyNodes(); }
+}
+
+async function deleteProxyNode(id) {
+  if (!confirm("确定删除这个出口节点？正在使用它的任务会退回直连。")) return;
+  const { ok } = await safeJson(await api(`/api/proxies/${id}`, { method: "DELETE" }));
+  if (ok) loadProxyNodes();
 }
 
 async function loadInvitation() {
@@ -857,6 +1004,34 @@ async function copyText(sel){
   toast(ok ? '已复制' : '复制失败，请选中文字复制', ok ? 'ok' : 'err');
 }
 
+/* 「点一下复制模型 ID」用**事件委派**，不再逐个 bind。
+ *
+ * 模型表每次翻页/筛选都整块重绘，分享面板每次展开也重绘 —— 逐元素绑定
+ * 一定会漏（漏掉的那些点了没反应，还看不出来是 bug）。委派一次，所有
+ * 带 `data-copy-model` 的元素自动继承，包括以后新加的位置。
+ */
+document.addEventListener("click", event => {
+  const el = event.target.closest && event.target.closest("[data-copy-model]");
+  if (!el) return;
+  event.stopPropagation();
+  copyRawText(el.dataset.copyModel || "");
+});
+
+/**
+ * 模型行要展示/复制的**完整调用名**：可读模型名 + 平台后缀。
+ *
+ * 后端 `/api/models/configs` 已经给了 `client_id`；这里保留兜底拼装，
+ * 是为了「浏览器缓存了旧接口响应」时不至于显示成没有后缀的裸名 ——
+ * 裸名在多平台同名时无法表达落点，正是用户要改掉的那个显示。
+ */
+function modelClientId(m) {
+  const base = String((m && m.model_id) || "");
+  if (m && m.client_id) return String(m.client_id);
+  const pid = String((m && m.platform) || "");
+  if (!base || !pid) return base;
+  return base.toLowerCase().endsWith("-" + pid.toLowerCase()) ? base : base + "-" + pid;
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   $("#modal")?.addEventListener("click", (e) => { if (e.target === $("#modal") && !$('#modal').dataset.closeOnly) closeModal(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$('#modal').dataset.closeOnly) closeModal(); });
@@ -958,15 +1133,40 @@ function showLoginCard() {
   if (app) app.classList.add("hidden");
   if (login) login.classList.remove("hidden");
 }
+/* 跨面板的侧栏角标：只打一个聚合接口。
+ *
+ * 「积分到期」那个小圆点原来挂在 `loadAccounts()` 的 summary 上 ——
+ * 于是**任何**页面首屏都要先把全量账号拉一遍才有这个数字。现在账号池只在
+ * 进「账号」组时加载，圆点改由 `/api/accounts/badges`（两个 COUNT）单独刷新。
+ * 失败就保持原样：一个提示点不值得重试或阻塞首屏。
+ */
+function refreshShellBadges() {
+  try {
+    api("/api/accounts/badges").then(async r => {
+      const { ok, data } = await safeJson(r);
+      if (ok && data) setSideDot("#sideExpiringDot", Number(data.expiring_accounts) || 0);
+    }).catch(() => {});
+  } catch (e) { /* 角标失败不影响任何功能 */ }
+}
+
 function enterApp() {
   document.documentElement.classList.remove("console-authed");
   $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
   $("#proxyUrl").textContent = location.origin + "/v1";
-  // 首屏只拉「概览 + 账号池 + 侧栏角标」需要的数据。
-  // 日志（loadLogs）**有意不在这里调**：它要额外打 3 个请求（选项/汇总/列表），
-  // 而用户可能根本不打开日志面板 —— 让首屏为它付代价是纯浪费，
-  // 改成切到该面板时由 openLogsPanel() 按需加载。
-  loadAccounts(); loadKeys(); loadModels(); loadSchedules(); loadSyncConfig(); loadShareInfo();
+  // ⚠️ 首屏**只做当前面板需要的事**。
+  //
+  // 以前这里无条件并发拉 6 份数据：账号池 / API Keys / 模型配置 / 定时任务 /
+  // 同步设置 / 对接信息。停在「日志」页的用户为此付了 6 个请求，其中
+  // `/api/accounts`（含凭证与积分快照）和 `/api/models/configs`（含倍率、
+  // 元数据、官方顺序）是最贵的两个 —— 线上账号与模型数量是本地测试数据的 n 倍，
+  // 这一下就是几百 KB 加几秒。
+  //
+  // 现在的分工：
+  //   · `activateTab()` 负责它自己那一屏的数据（每个面板都有对应的 loadXxx）；
+  //   · 侧栏「积分到期」圆点是**跨面板**的提示，用极小的聚合接口单独刷；
+  //   · 日志页的筛选选项（模型 / Key）由 `fillLogFilterOptions()` 自愈补齐。
+  // 需要额外数据的页面自己会在进面板时补，不存在「切过去是空的」。
+  refreshShellBadges();
   // 还原地址栏里的面板（刷新后停在原页面，而不是跳回「账号」首页）。
   // updateUrl:false —— 地址栏本来就是这个值，不必再写一次。
   //
@@ -1240,11 +1440,15 @@ function activateTab(name, opts) {
   if (name === "usage") loadUsageStats();
   if (name === "keys") { loadKeys(); loadShareInfo(); }
   if (name === "ip") window.WBIP?.load();
+  // 同步设置：首屏不再无条件加载，切到这一屏时按需拉。
+  // （以前漏了这一条是因为 enterApp 里loadSyncConfig 是无条件跑的 ——
+  //   一旦改成懒加载，漏掉的分支就会变成「切过去是空白」。）
+  if (name === "sync") loadSyncConfig();
   if (name === "credits") loadCreditStats();
   if (name === "logs") openLogsPanel();
   if (name === "client") initClientPanel();
   if (name === "alerts") loadAlerts();
-  if (name === "settings") { loadAppSource(); loadInvitation(); loadRuntimeConfig(); }
+  if (name === "settings") { loadAppSource(); loadInvitation(); loadRuntimeConfig(); loadProxyNodes(); }
   // 模型面板：进入时按当前平台重置过滤（见 loadModels 的说明）。
   if (name === "models") { resetModelFilter(); loadModels(); }
   // 定时任务：必须等平台解析完再加载 —— `loadSchedules` 要按平台过滤
@@ -1391,7 +1595,23 @@ function ovPct(value, digits = 1) {
   return (Number(value) * 100).toFixed(digits) + "%";
 }
 
-async function loadOverview(force) {
+/**
+ * 概览加载。
+ *
+ * `opts.scope`：
+ *   · `"all"`（默认）—— 整页：额度 / 用量 / 缓存 / 账号监测 / 平台状态；
+ *   · `"usage"`     —— **只**刷「用量 + 缓存命中率」两张卡。
+ *
+ * 为什么要分档：右上角「今日 / 7 天 / 30 天」是局部滤镜，它只改变这两张卡
+ * 的口径。可原来切换一次要重算整份概览（额度 2 条 SQL + 今日/窗口/本月
+ * 3 次扫描 + 账号监测 + 模型/Key 计数），前端还把**整页卡片**盖上一层
+ * `ov-dim`、把左侧「剩余额度」重新从 0 滚一遍 —— 用户看到的就是
+ * 「点个时间 tab，整页重新加载一遍」，而左侧那些数字根本与区间无关。
+ *
+ * 现在切 tab 只打 `sections=usage`（2 次聚合），左侧额度与账号监测**一动不动**。
+ */
+async function loadOverview(force, opts = {}) {
+  const usageOnly = opts.scope === "usage";
   // 区间按钮的选中态
   document.querySelectorAll("[data-ov-days]").forEach(btn => {
     btn.classList.toggle("active", Number(btn.dataset.ovDays) === _ovDays);
@@ -1402,11 +1622,15 @@ async function loadOverview(force) {
   // 接着滚。数据没变时 from == to，视觉上完全静止 —— 用户点了「刷新」
   // 或重新进入面板，会觉得「没反应 / 有缓存」。重置后每次都是 0 -> N，
   // 一眼就能确认「确实是重新取过了」。
+  //
+  // 局部刷新只重置**要更新的那几个**：左侧额度不该跟着从 0 滚一遍。
   if (force) {
-    document.querySelectorAll(
-      "#ovBalance, #ovReq, #ovTokIn, #ovTokOut, #ovTokAll, " +
-      "#ovCacheHit, #ovCachePrompt, #ovCacheSamples"
-    ).forEach(el => { delete el.dataset.countValue; });
+    const resetIds = usageOnly
+      ? "#ovReq, #ovTokIn, #ovTokOut, #ovTokAll, " +
+        "#ovCacheHit, #ovCachePrompt, #ovCacheSamples"
+      : "#ovBalance, #ovReq, #ovTokIn, #ovTokOut, #ovTokAll, " +
+        "#ovCacheHit, #ovCachePrompt, #ovCacheSamples";
+    document.querySelectorAll(resetIds).forEach(el => { delete el.dataset.countValue; });
   }
 
   // ---- 加载态 ----
@@ -1417,8 +1641,15 @@ async function loadOverview(force) {
   //
   // 这里加一层：立刻显示转圈 + 骨架屏（卡片保持占位、数字位置显示骨架条），
   // 数据回来再替换。即使真的慢，用户也知道「在加载」而不是「坏了」。
-  _ovSetLoading(true);
+  _ovSetLoading(true, usageOnly);
   try {
+    if (usageOnly) {
+      const data = await api(`/api/overview?days=${_ovDays}&sections=usage`)
+        .then(r => r.ok ? r.json() : null);
+      if (!data) return;
+      renderOverviewUsage(data);
+      return;
+    }
     const [data, platforms, sentinel] = await Promise.all([
       api(`/api/overview?days=${_ovDays}`).then(r => r.ok ? r.json() : null),
       api("/api/platforms").then(r => r.ok ? r.json() : null).catch(() => null),
@@ -1430,17 +1661,22 @@ async function loadOverview(force) {
     const host = $("#ovStatus");
     if (host) host.innerHTML = `<span style="color:var(--danger)">概览加载失败：${esc(e.message)}</span>`;
   } finally {
-    _ovSetLoading(false);
+    _ovSetLoading(false, usageOnly);
   }
 }
 
-/** 概览加载态开关：状态条转圈 + 数字位骨架屏。 */
-function _ovSetLoading(on) {
+/**
+ * 概览加载态开关：状态条转圈 + 数字位骨架屏。
+ *
+ * `usageOnly` 时不碰左侧额度卡与账号监测卡：局部刷新还把它们变灰/变骨架，
+ * 就是「点个时间 tab 整页重载」的观感来源。
+ */
+function _ovSetLoading(on, usageOnly) {
   const bar = document.getElementById("ovStatus");
   if (bar) {
     bar.classList.toggle("ov-loading", !!on);
     // 只在还没有真实内容时插入占位文案，避免覆盖已有数据
-    if (on && !bar.dataset.filled) {
+    if (on && !usageOnly && !bar.dataset.filled) {
       bar.innerHTML = `<div class="ov-status-left">
         <span class="ov-loading-dot"></span>
         <span class="ov-muted">正在加载概览…</span>
@@ -1449,15 +1685,20 @@ function _ovSetLoading(on) {
     if (!on) bar.dataset.filled = "1";
   }
   // 数字位骨架：给每个大数字套一个 shimmer 占位
-  const ids = ["#ovBalance", "#ovReq", "#ovTokIn", "#ovTokOut", "#ovTokAll",
-               "#ovCacheHit"];
+  const ids = usageOnly
+    ? ["#ovReq", "#ovTokIn", "#ovTokOut", "#ovTokAll", "#ovCacheHit"]
+    : ["#ovBalance", "#ovReq", "#ovTokIn", "#ovTokOut", "#ovTokAll", "#ovCacheHit"];
   ids.forEach(sel => {
     const el = document.querySelector(sel);
     if (!el) return;
     el.classList.toggle("ov-skeleton", !!on);
   });
-  // 账号监测 / 平台卡也标一下，避免半截数据看起来像最终结果
-  document.querySelectorAll(".ov-card").forEach(card => {
+  // 账号监测 / 平台卡也标一下，避免半截数据看起来像最终结果。
+  // 局部刷新只压「用量 / 缓存」两张卡，别的卡照常显示原数据。
+  const cards = usageOnly
+    ? document.querySelectorAll('.ov-card[data-ov-scope="usage"]')
+    : document.querySelectorAll(".ov-card");
+  cards.forEach(card => {
     card.classList.toggle("ov-dim", !!on);
   });
 }
@@ -1504,10 +1745,15 @@ function _psBar(width, height) {
 
 /** 把克隆体里的文字换成灰条（宽度按元素自身实测）。 */
 function _psBlankTextNodes(root) {
+  // root 是 .ps-clone（骨架层里的包装 div），真正的骨架层是它的祖先
+  // .panel-skeleton。旧守卫拿 clone 自己跟 closest(".panel-skeleton") 比，
+  // 永远不相等 —— 所有元素都被 continue 跳过，文字从没换成灰条，
+  // 骨架看起来就是「第二份真实内容」（智能体页重影的一半来源）。
+  const sk = root.closest(".panel-skeleton") || root;
   const nodes = root.querySelectorAll("*");
   for (const el of nodes) {
     if (el.classList.contains("ps-bar")) continue;
-    if (el.closest(".panel-skeleton") !== root && el !== root) continue;
+    if (el.closest(".panel-skeleton") !== sk && el !== root) continue;
     // 只处理「叶子」：没有元素子节点、但有文字
     if (el.children.length) continue;
     const text = (el.textContent || "").trim();
@@ -1666,6 +1912,10 @@ function _panelSkeletonFromDom(panel) {
  */
 function panelSkeletonShow(name, force) {
   if (!name || name === "overview") return;      // 概览有自己的加载态
+  // 智能体面板跳过：它本身就是静态外壳 + 自管加载态（侧栏「加载中…」），
+  // 骨架克隆只会复制出第二份外壳；且它的请求不走 api()，骨架只能靠
+  // 1.8s 兜底才收 —— 网慢时用户看到的就是「两套创作台」。
+  if (name === "agent") return;
   const panel = document.getElementById("panel-" + name);
   if (!panel) return;
   const first = !_panelSeen.has(name);
@@ -1723,11 +1973,140 @@ function _panelSkeletonFlush() {
   });
 }
 
+/**
+ * 「用量 + 缓存命中率」两张卡：**整页刷新与切区间共用同一段渲染**。
+ *
+ * 共用的意义不只是少写一遍：两条路径（`/api/overview` 与
+ * `?sections=usage`）的字段口径完全一致，同一个函数渲染，
+ * 就不会出现「切到 7 天再切回今日，数字跟整页刷新时不一样」的漂移。
+ *
+ * 它**不碰**左侧额度卡的主数字与进度条，只更新那一行区间消耗文本 ——
+ * 那个数字本来就是区间口径，光切区间不更新会自相矛盾。
+ */
+function renderOverviewUsage(data) {
+  const win = data.window || {};
+  // 四个数字都做计数动效
+  countTo("#ovReq", win.requests, ovNum);
+  countTo("#ovTokIn", win.prompt_tokens, ovNum);
+  countTo("#ovTokOut", win.completion_tokens, ovNum);
+  countTo("#ovTokAll", win.total_tokens, ovNum);
+
+  const scope = $("#ovUsageScope");
+  if (scope) {
+    scope.textContent = `统计范围: ${_ovDays === 1 ? "今日" : _ovDays + " 天"}${
+      win.ok_requests !== undefined && win.requests
+        ? ` · 成功率 ${ovPct(win.ok_requests / win.requests, 1)}` : ""}`;
+  }
+  // 额度卡里的「N 天消耗」：区间口径，跟着变；但整张卡不重画。
+  const winLabel = $("#ovWinLabel");
+  const winCredits = $("#ovWinCredits");
+  if (winLabel) winLabel.textContent = `${win.days || _ovDays || 1} 天消耗`;
+  if (winCredits) winCredits.textContent = ovCredit(win.credits);
+
+  renderOverviewCache(data.cache || {});
+
+  const at = $("#ovUpdatedAt");
+  if (at) at.textContent = "更新于 " + fmtTime(new Date().toISOString().slice(0, 19), false);
+}
+
+/**
+ * 缓存命中率卡：环图 + 命中/未命中构成 + 分平台。
+ *
+ * 这张卡原来只有「环图 + 4 个数字 + 一行说明」，右侧却占满三行的高度 ——
+ * 截图上左下角就是一大片空白。补的三样东西都来自同一份聚合结果
+ * （`/api/overview` 的 `cache` 段），不额外打接口：
+ *
+ *   · `miss_tokens`   —— 未命中的输入 token。只给 99% 不告诉「还剩多少没吃到」，
+ *     用户没法判断这 99% 到底省了多少；
+ *   · 命中/未命中构成条 —— 一眼看出比例，不用心算；
+ *   · `by_platform`   —— 分平台命中率。命中率是**平台差异极大**的一项，
+ *     混成一个总数时，某个平台掉到 60% 会被另一个平台的 99% 盖住。
+ */
+function renderOverviewCache(cache) {
+  const rate = cache.rate;
+  const prompt = Number(cache.prompt_tokens || 0);
+  const hit = Number(cache.cached_tokens || 0);
+  const miss = cache.miss_tokens != null
+    ? Math.max(0, Number(cache.miss_tokens) || 0)
+    : Math.max(0, prompt - hit);
+  const pctVal = rate == null ? 0 : Math.min(100, Math.max(0, rate * 100));
+
+  // ---- 环形图 ----
+  const donut = $("#ovDonut");
+  if (donut) {
+    donut.style.background =
+      `conic-gradient(var(--brand) ${pctVal}%, var(--surface-2) 0)`;
+  }
+  // 环形图中心数字：它要带 `<span class="ov-donut-unit">%</span>`，
+  // 而计数器组件按 textContent 写值 —— 两者不兼容。
+  // 这里保留原写法（直接 innerHTML），百分比变化本身不需要滚动动效：
+  // 圆环的 conic-gradient 已经有过渡动画，数字再滚会显得吵。
+  const donutEl = $("#ovDonutVal");
+  if (donutEl) {
+    donutEl.innerHTML = rate == null ? "—"
+      : `${pctVal.toFixed(0)}<span class="ov-donut-unit">%</span>`;
+  }
+  countTo("#ovCacheHit", hit, ovNum);
+  countTo("#ovCachePrompt", prompt, ovNum);
+  countTo("#ovCacheSamples", cache.samples, ovNum);
+  const rateEl = $("#ovCacheRate");
+  if (rateEl) rateEl.textContent = rate == null ? "—" : ovPct(rate);
+
+  // ---- 命中 / 未命中构成条 ----
+  const split = $("#ovCacheSplit");
+  if (split) {
+    if (!prompt) {
+      split.innerHTML = `<div class="ov-cache-empty">当前区间没有可统计的输入 token</div>`;
+    } else {
+      const hitRatio = Math.min(100, Math.max(0, (hit / prompt) * 100));
+      split.innerHTML = `
+        <div class="ov-cache-split-head">
+          <span>命中 ${ovPct(hit / prompt, 1)}</span>
+          <span class="ov-muted">未命中 ${ovPct(miss / prompt, 1)}</span>
+        </div>
+        <div class="ov-cache-track"
+             data-tooltip="输入 token 的命中构成"
+             data-tooltip-description="命中：上游直接复用了前缀缓存，不重复计费。未命中：需要上游重新计算的部分。分母只含带缓存字段的成功请求。">
+          <div class="ov-cache-fill" style="width:${hitRatio.toFixed(1)}%"></div>
+        </div>
+        <div class="ov-cache-split-foot">
+          <span><span class="ov-dot brand"></span> 命中 ${ovNum(hit)}</span>
+          <span><span class="ov-dot muted"></span> 未命中 ${ovNum(miss)}</span>
+        </div>`;
+    }
+  }
+
+  // ---- 分平台命中率 ----
+  const host = $("#ovCachePlatforms");
+  if (host) {
+    const rows = cache.by_platform || [];
+    host.innerHTML = rows.length
+      ? `<div class="ov-cache-plat-head"><span>按平台</span><span>输入 token</span></div>` +
+        rows.map(item => {
+          const r = item.rate == null ? 0 : Math.min(100, Math.max(0, item.rate * 100));
+          return `<div class="ov-cache-plat">
+            <span class="ov-cache-plat-name" data-tooltip="${esc(item.label || item.platform || "")}"
+                  data-tooltip-description="命中 ${ovNum(item.cached_tokens)} / 输入 ${ovNum(item.prompt_tokens)} · 样本 ${fmtNum(item.samples || 0)}">${esc(item.label || item.platform || "—")}</span>
+            <span class="ov-cache-plat-track"><i style="width:${r.toFixed(1)}%"></i></span>
+            <span class="ov-cache-plat-rate">${item.rate == null ? "—" : ovPct(item.rate, 1)}</span>
+            <span class="ov-cache-plat-tok">${ovNum(item.prompt_tokens)}</span>
+          </div>`;
+        }).join("")
+      : `<div class="ov-cache-empty">这个区间没有分平台数据</div>`;
+  }
+
+  const noteEl = $("#ovCacheNote");
+  if (noteEl) {
+    noteEl.textContent = cache.note
+      || (rate == null ? "当前区间没有可统计的输入 token" : "只统计含缓存字段的上游响应");
+  }
+}
+
 function renderOverview(data, platforms, sentinel) {
   const acc = data.accounts || {};
   const today = data.today || {};
   const win = data.window || {};
-  const cache = data.cache || {};
+  // `data.cache` 由 renderOverviewUsage → renderOverviewCache 消费，这里不再解构。
   const monitor = data.monitor || {};
 
   // ---- 运行状态条 ----
@@ -1741,7 +2120,7 @@ function renderOverview(data, platforms, sentinel) {
       <button type="button" class="ov-mini-btn" onclick="copyApiBase()">复制</button>
     </div>
     <div class="ov-status-right">
-      <span class="ov-muted">更新于 ${fmtTime(new Date().toISOString().slice(0,19), false)}</span>
+      <span id="ovUpdatedAt" class="ov-muted">更新于 ${fmtTime(new Date().toISOString().slice(0,19), false)}</span>
     </div>`;
 
   // ---- 告警横幅：有封控信号才出现 ----
@@ -1778,7 +2157,7 @@ function renderOverview(data, platforms, sentinel) {
   countTo("#ovBalance", acc.balance_remain, (n) => ovInt(Math.round(n)));
   $("#ovBalanceRow").innerHTML = `
     <div>今日消耗 <span>${ovCredit(today.credits)}</span></div>
-    <div>${win.days || 1} 天消耗 <span>${ovCredit(win.credits)}</span></div>
+    <div><span id="ovWinLabel">${win.days || 1} 天消耗</span> <span id="ovWinCredits">${ovCredit(win.credits)}</span></div>
     <div>户均 <span>${data.average_credits == null ? "—" : ovCredit(data.average_credits)}</span></div>`;
   $("#ovBalanceNote").textContent = acc.disabled_balance
     ? `另有 ${ovInt(acc.disabled_balance)} 在已禁用账号上，不参与统计`
@@ -1795,36 +2174,12 @@ function renderOverview(data, platforms, sentinel) {
       : ratio > 0.7 ? "var(--warn,#f59e0b)" : "var(--brand)";
   }
 
-  // ---- 用量（四个数字都做计数动效）----
-  countTo("#ovReq", win.requests, ovNum);
-  countTo("#ovTokIn", win.prompt_tokens, ovNum);
-  countTo("#ovTokOut", win.completion_tokens, ovNum);
-  countTo("#ovTokAll", win.total_tokens, ovNum);
+  // ---- 用量 / 缓存命中率：两张卡的渲染收在 renderOverviewUsage，
+  //      切区间时只重跑这一段（见 loadOverview 的 scope=usage）----
   $("#ovUsageFoot").innerHTML = `
     <div>API Key <span class="ov-dot-sep">•</span> 模型: <b>${data.models || 0}</b></div>
-    <div>统计范围: ${_ovDays === 1 ? "今日" : _ovDays + " 天"}${
-      win.ok_requests !== undefined && win.requests
-        ? ` · 成功率 ${ovPct(win.ok_requests / win.requests, 1)}` : ""}</div>`;
-
-  // ---- 缓存命中率（conic-gradient 环形图）----
-  const rate = cache.rate;
-  const donut = $("#ovDonut");
-  const pctVal = rate == null ? 0 : Math.min(100, Math.max(0, rate * 100));
-  donut.style.background =
-    `conic-gradient(var(--brand) ${pctVal}%, var(--surface-2) 0)`;
-  // 环形图中心数字：它要带 `<span class="ov-donut-unit">%</span>`，
-  // 而计数器组件按 textContent 写值 —— 两者不兼容。
-  // 这里保留原写法（直接 innerHTML），百分比变化本身不需要滚动动效：
-  // 圆环的 conic-gradient 已经有过渡动画，数字再滚会显得吵。
-  const donutEl = $("#ovDonutVal");
-  donutEl.innerHTML = rate == null ? "—"
-    : `${pctVal.toFixed(0)}<span class="ov-donut-unit">%</span>`;
-  countTo("#ovCacheHit", cache.cached_tokens, ovNum);
-  $("#ovCacheRate").textContent = rate == null ? "—" : ovPct(rate);
-  countTo("#ovCachePrompt", cache.prompt_tokens, ovNum);
-  countTo("#ovCacheSamples", cache.samples, ovNum);
-  $("#ovCacheNote").textContent = cache.note
-    || (rate == null ? "当前区间没有可统计的输入 token" : "只统计含缓存字段的上游响应");
+    <div id="ovUsageScope"></div>`;
+  renderOverviewUsage(data);
 
   // ---- 账号监测：状态条 + 异常账号列表 ----
   const buckets = [
@@ -1938,14 +2293,18 @@ function setSideDot(selector, n) {
   }
 }
 
-/* 区间切换：只改状态再重取，不重载页面 */
+/* 区间切换：只改状态再重取 —— 而且**只重取区间相关的那两段**。
+ *
+ * 左侧「剩余额度」、右侧「账号监测」「平台状态」与统计区间无关，
+ * 以前一次点击会把它们一起变灰、一起重算（整页重载的观感），
+ * 现在只打 `/api/overview?sections=usage`。 */
 document.addEventListener("click", event => {
   const btn = event.target.closest("[data-ov-days]");
   if (!btn) return;
   const next = Number(btn.dataset.ovDays) || 1;
   if (next === _ovDays) return;
   _ovDays = next;
-  loadOverview(true);
+  loadOverview(true, { scope: "usage" });
 });
 
 /* ==========================================================================
@@ -2548,6 +2907,8 @@ document.addEventListener("wb-platform-change", () => {
   // 显示成空列表或别的平台的模型。
   if (active === "models") { resetModelFilter(); loadModels(); }
   if (active === "schedules") loadSchedules();
+  // 同步设置：与桌面 activateTab 保持一致（首屏不再无条件加载它）
+  if (active === "sync") loadSyncConfig();
 });
 
 /* ==========================================================================
@@ -2991,6 +3352,7 @@ function consoleIcon(name) {
     "fa-stopwatch": "<circle cx=\"12\" cy=\"13\" r=\"8\"/><path d=\"M12 9v4l2.5 2.5M9 2h6\"/>",
     "fa-file-import": "<path d=\"M12 3H4v18h12v-5M9 14h12m-4-4 4 4-4 4\"/>",
     "fa-heart-pulse": "<path d=\"M3 12h4l2-6 4 12 2-6h6\"/>",
+    "fa-calendar-check": "<rect x=\"3\" y=\"4\" width=\"18\" height=\"18\" rx=\"2\"/><path d=\"M16 2v4M8 2v4M3 10h18m-5 4-3 3-2-2\"/>",
     "fa-sliders": "<path d=\"M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0\"/><circle cx=\"16\" cy=\"6\" r=\"2\"/><circle cx=\"10\" cy=\"12\" r=\"2\"/><circle cx=\"18\" cy=\"18\" r=\"2\"/>",
     "fa-ellipsis": "<circle cx=\"5\" cy=\"12\" r=\"1.6\"/><circle cx=\"12\" cy=\"12\" r=\"1.6\"/><circle cx=\"19\" cy=\"12\" r=\"1.6\"/>",
     "fa-snowflake": "<path d=\"M12 2v20M4 6l16 12M20 6 4 18\"/><path d=\"m9 4 3 3 3-3M9 20l3-3 3 3\"/>"
@@ -3339,6 +3701,25 @@ function isEnterpriseAccount(a) {
   return !!(a && String(a.enterprise_id || '').trim());
 }
 
+/** 系统通用账号操作（**与平台上游无关**，所有平台的号都该有）。
+ *
+ * 2026-11-07 统一：此前只有 WorkBuddy 的号池行带这套，Trae/Qoder/Loomy/
+ * CodeArts/MiniMax 各自的行渲染器只有 2~3 个平台专属按钮，删除 / 导出
+ * 凭证 / 禁用 / 通用刷新全都没有 —— 用户要删个 Qoder 号得去别处找入口。
+ *
+ * `refreshAcc` 内部已按账号平台分流到 `/api/{storage}/accounts/{id}/refresh`，
+ * 各平台原来的专属刷新按钮（qoderRefresh / loomyRefresh / traeRefresh …）
+ * 打的是**同一个端点**，统一收编成这一个。
+ */
+function commonAccountOps(a) {
+  return [
+    [`refreshAcc(${a.id})`, "fa-rotate", "刷新余额与到期快照", "maintain"],
+    [`exportAcc(${a.id},${jsv(a.name || '')})`, "fa-file-export", "导出登录态", "data"],
+    [`toggleAcc(${a.id},'${a.status === 'active' ? 'disabled' : 'active'}')`, "fa-power-off", "启用/禁用", "danger"],
+    [`delAcc(${a.id})`, "fa-trash", "删除", "danger"],
+  ];
+}
+
 function accOpsHtml(a, ops) {
   // 条目形状：[onclick, icon, tooltip, group]
   const primary = [];
@@ -3510,14 +3891,11 @@ function accRow(a) {
     ops.push([`catTravel(${a.id})`, "fa-cat", "猫猫旅行", "grow"]);
   }
   ops.push(
-    [`refreshAcc(${a.id})`, "fa-rotate", "刷新余额与到期快照", "maintain"],
     [`healthCheckAcc(${a.id})`, "fa-heart-pulse", "三项健康检查：积分、模型列表、真实对话", "maintain"],
     [`openReauthAccount(${a.id})`, "fa-key", "重新登录", "maintain"],
     [`injectAcc(${a.id})`, "fa-right-to-bracket", "注入本机客户端", "maintain"],
     [`WBReview.accountLimit(${a.id})`, "fa-sliders", "账号并发上限", "maintain"],
-    [`exportAcc(${a.id},${jsv(a.name||'')})`, "fa-file-export", "导出登录态", "data"],
-    [`toggleAcc(${a.id},'${a.status==='active'?'disabled':'active'}')`, "fa-power-off", "启用/禁用", "danger"],
-    [`delAcc(${a.id})`, "fa-trash", "删除", "danger"],
+    ...commonAccountOps(a),
   );
   // data-label 是给**窄屏卡片形态**用的字段名（见 CSS 里的移动端段落）：
   // 窄屏下表格变成卡片，靠 `td::before { content: attr(data-label) }`
@@ -3598,6 +3976,7 @@ function accReloadActive() {
   const storage = String(spec.storage_platform || spec.id || "").toLowerCase();
   if (storage === "loomy") return loadLoomyAccounts(spec);
   if (storage === "codearts") return loadCodeArtsAccounts(spec);
+  if (storage === "minimax") return loadMinimaxAccounts(spec);
   if (storage === "trae") return loadTraeAccounts(spec);
   if (storage === "qoder") return loadQoderAccounts(spec);
   return loadAccounts();
@@ -3719,6 +4098,9 @@ async function loadAccounts() {
   if (storage === "codearts") {
     return loadCodeArtsAccounts(platform);
   }
+  if (storage === "minimax") {
+    return loadMinimaxAccounts(platform);
+  }
   const r = await api("/api/accounts?" + accListQS()); if (!r.ok) return;
   // 从 Trae 切回默认平台时把表头/脚注还原（两平台列语义不同，必须显式复位）
   // 表头列宽由 `.col-*` 语义类决定（不再依赖 nth-child，见 index.html 注释）。
@@ -3832,14 +4214,11 @@ function traeRow(a) {
     <td class="tnum text-right font-medium" data-label="剩余" style="color:${a.balance_remain > 0 ? "var(--ok,#33587F)" : "var(--danger)"}">${fmtCredit(a.balance_remain)}${unit}</td>
     <td class="col-expiry" data-label="凭证到期">${esc(expires)}</td>
     ${accCreatedCell(a)}
-    <td class="c-ops" data-label="操作">${[
-      [`traeRefresh(${a.id})`, "fa-rotate", "text-indigo-600", "刷新 token 与额度"],
-      [`traeTest(${a.id})`, "fa-heart-pulse", "text-emerald-600", "连通性检查：token / 模型 / 真实对话 / 额度"],
-      [`traeClearCooling(${a.id})`, "fa-snowflake", "text-sky-600", "清除冷却与熔断"],
-      [`traeToggle(${a.id},'${a.status === "active" ? "disabled" : "active"}')`, "fa-power-off", "text-slate-500", "启用/禁用"],
-      [`traeDelete(${a.id})`, "fa-trash", "text-red-500", "删除"],
-    ].map(([fn, icon, color, title]) =>
-      `<button onclick="${fn}" class="acc-op-btn${(title === "删除" || title === "启用/禁用") ? " is-danger" : ""}" data-tooltip="${title}" aria-label="${title}">${consoleIcon(icon)}</button>`).join("")}</td>
+    <td class="c-ops" data-label="操作">${accOpsHtml(a, [
+      [`traeTest(${a.id})`, "fa-heart-pulse", "连通性检查：token / 模型 / 真实对话 / 额度", "maintain"],
+      [`traeClearCooling(${a.id})`, "fa-snowflake", "清除冷却与熔断", "maintain"],
+      ...commonAccountOps(a),
+    ])}</td>
   </tr>`;
 }
 
@@ -4015,12 +4394,10 @@ function qoderRow(a) {
         style="color:${(a.addon_remain || 0) > 0 ? "var(--ok)" : "var(--fg-subtle)"}">${fmtCredit(a.addon_remain)}</td>
     <td class="col-expiry text-xs" data-label="套餐">${plan}</td>
     ${accCreatedCell(a)}
-    <td class="c-ops" data-label="操作">${[
-      [`qoderRefresh(${a.id})`, "fa-rotate", "text-indigo-600", "刷新额度"],
-      [`qoderTest(${a.id})`, "fa-heart-pulse", "text-emerald-600", "连通性检查"],
-    ].map(([fn, icon, color, title]) =>
-      `<button onclick="${fn}" class="acc-op-btn" data-tooltip="${title}" aria-label="${title}">${consoleIcon(icon)}</button>`
-    ).join("")}</td>
+    <td class="c-ops" data-label="操作">${accOpsHtml(a, [
+      [`qoderTest(${a.id})`, "fa-heart-pulse", "连通性检查：凭证 / 资料 / 模型 / 额度", "maintain"],
+      ...commonAccountOps(a),
+    ])}</td>
   </tr>`;
 }
 
@@ -4081,13 +4458,16 @@ async function loadLoomyAccounts(platform) {
   if (head) {
     head.innerHTML = `${pickAllTh()}<th class="col-name">账号</th><th class="col-status">状态</th>
       <th class="col-balance text-right">可用积分</th><th class="col-extra text-right">当日额度</th>
+      <th class="col-extra text-right">登录态有效期</th>
       <th class="col-created">入库时间</th><th class="col-ops text-right">操作</th>`;
     setAccOpsWidth(110);
   }
   const foot = $("#accFootNote");
-  if (foot) foot.textContent = "可用积分 = 基础余额 + 当日额度（当日部分每日重置）";
+  if (foot) foot.textContent =
+    "可用积分 = 基础余额 + 当日额度（当日部分每日重置）· 登录态有效期 = 登录时间 + 14 天";
   const footHint = $("#accFootHint");
-  if (footHint) footHint.textContent = "凭证为客户端明文 auth-session.json，可重复扫描同步";
+  if (footHint) footHint.textContent =
+    "凭证为客户端明文 auth-session.json，可重复扫描同步 · 只有「手机号+密码」注册的号才支持自动续签";
 
   accServerTabs(d.paginated ? s
     : { total: _accData.length,
@@ -4123,6 +4503,27 @@ function loomyRow(a) {
   const err = (a.last_err_msg && ok)
     ? `<small style="color:var(--danger)" data-tooltip="最近上游错误" data-tooltip-description="${esc(a.last_err_msg)}">${esc(String(a.last_err_msg).slice(0, 36))}</small>`
     : "";
+  // ---- session 有效期 ----
+  // Loomy 没有 refresh 接口（实测 404）：session 自登录起 14 天，到期必失效。
+  // 后端按「客户端 updatedAt + 14 天」算好 `session_days_left` 透出来，
+  // 快到期（≤3 天）时标黄 —— 用户能提前安排重扫，而不是某天发现号全挂了。
+  const days = (typeof a.session_days_left === "number") ? a.session_days_left : null;
+  // 有没有存手机号+密码 —— 决定这个号到期后能不能自动续上。
+  // 接码注册、没设密码的号**续不了**（服务端没有 refresh 接口），
+  // 到期只能重新扫描 / 短信重登 / 注册时设密码。
+  const renewable = a.renewable === true;
+  let sessionCell;
+  if (days == null) {
+    sessionCell = '<small style="color:var(--fg-subtle)" data-tooltip="未记录登录时间" data-tooltip-description="这张凭证没有登录时间锚点。跑一次「会话保活」会补上（按「首次确认有效 + 14 天」保守估算）。">未知</small>';
+  } else if (days < 0) {
+    sessionCell = '<span class="badge badge-warn" data-tooltip="session 已过期" data-tooltip-description="Loomy 没有 refresh 接口，需在客户端重新登录后重新扫描导入，或走短信重登。">已过期</span>';
+  } else if (days <= 3) {
+    sessionCell = renewable
+      ? `<span class="badge badge-ok" data-tooltip="即将到期，会自动续签">剩 ${days} 天 · 自动续</span>`
+      : `<span class="badge badge-warn" data-tooltip="即将到期，且无法自动续签" data-tooltip-description="这个号没有存手机号+密码，而 Loomy 服务端没有 refresh 接口 —— 到期后只能重新登录客户端扫描、或用短信验证码重登、或重新注册时设密码。">剩 ${days} 天 · 需手动</span>`;
+  } else {
+    sessionCell = `<small style="color:var(--fg-muted)">剩 ${Math.round(days)} 天${renewable ? " · 可续签" : " · 无密码"}</small>`;
+  }
   return `<tr>
     <td class="c-name">
       <div class="nm">
@@ -4137,13 +4538,12 @@ function loomyRow(a) {
         style="color:${a.balance_remain > 0 ? "var(--brand)" : "var(--danger)"}">${fmtCredit(a.balance_remain)}</td>
     <td class="tnum text-right" data-label="当日额度"
         style="color:var(--fg-muted)">${fmtCredit(a.daily_balance)}</td>
+    <td class="text-xs text-right" data-label="登录态有效期">${sessionCell}</td>
     ${accCreatedCell(a)}
-    <td class="c-ops" data-label="操作">${[
-      [`loomyRefresh(${a.id})`, "fa-rotate", "text-indigo-600", "探活并刷新"],
-      [`loomyTest(${a.id})`, "fa-heart-pulse", "text-emerald-600", "连通性检查"],
-    ].map(([fn, icon, color, title]) =>
-      `<button onclick="${fn}" class="acc-op-btn" data-tooltip="${title}" aria-label="${title}">${consoleIcon(icon)}</button>`
-    ).join("")}</td>
+    <td class="c-ops" data-label="操作">${accOpsHtml(a, [
+      [`loomyTest(${a.id})`, "fa-heart-pulse", "连通性检查", "maintain"],
+      ...commonAccountOps(a),
+    ])}</td>
   </tr>`;
 }
 
@@ -4299,12 +4699,10 @@ function codeartsRow(a) {
         style="color:var(--fg-muted)">${fmtCredit(a.balance_total)}</td>
     <td class="col-expiry text-xs" data-label="套餐">${plan}${pkgNote}</td>
     ${accCreatedCell(a)}
-    <td class="c-ops" data-label="操作">${[
-      [`codeartsRefresh(${a.id})`, "fa-rotate", "刷新凭证与额度"],
-      [`codeartsTest(${a.id})`, "fa-heart-pulse", "分段连通性检查"],
-    ].map(([fn, icon, title]) =>
-      `<button onclick="${fn}" class="acc-op-btn" data-tooltip="${title}" aria-label="${title}">${consoleIcon(icon)}</button>`
-    ).join("")}</td>
+    <td class="c-ops" data-label="操作">${accOpsHtml(a, [
+      [`codeartsTest(${a.id})`, "fa-heart-pulse", "分段连通性检查", "maintain"],
+      ...commonAccountOps(a),
+    ])}</td>
   </tr>`;
 }
 
@@ -4329,6 +4727,161 @@ async function codeartsTest(id) {
   const lines = Object.keys(stages).map(k =>
     `${k}: ${stages[k].ok ? "✓" : "✗"} ${stages[k].detail || ""}`);
   openModal(`<h3 class="font-semibold text-lg mb-3">连通性检查 · ${esc(data.account || "")}</h3>
+    <pre class="text-xs" style="background:var(--surface-2);padding:12px;border-radius:8px">${esc(lines.join("\n"))}</pre>`);
+}
+
+// ---- MiniMax Code（Anthropic 协议上游，积分 = 签到 credit details 求和）----
+
+async function loadMinimaxAccounts(platform) {
+  const r = await api("/api/minimax/accounts?" + accListQS());
+  const body = $("#accBody");
+  if (!r.ok) {
+    if (body) {
+      body.innerHTML = `<tr><td colspan="8"><div class="account-empty">
+        <strong>读取 MiniMax 账号失败</strong>HTTP ${r.status}</div></td></tr>`;
+    }
+    return;
+  }
+  const d = await r.json();
+  const items = d.items || [];
+  _accData = items;
+  const active = items.filter(a => a.status === "active");
+  const remain = active.reduce((sum, i) => sum + (i.balance_remain || 0), 0);
+  const total = active.reduce((sum, i) => sum + (i.balance_total || 0), 0);
+
+  $("#overview").innerHTML = `
+    ${statCard("账号总数", items.length, { icon: "fa-users", iconColor: "text-slate-400",
+        sub: `启用 ${active.length}` + (items.length - active.length ? ` · 已禁用 ${items.length - active.length}` : "") })}
+    ${statCard("可用积分", fmtCredit(remain), { icon: "fa-wallet", iconColor: "text-slate-400",
+        tone: "brand", sub: `累计发放 ${fmtCredit(total)} · 签到积分 30 天有效` })}
+    ${statCard("可用模型", 4, { icon: "fa-cube", iconColor: "text-slate-400",
+        sub: "M2.7 / M2.7-highspeed / M3 / M3.1-Flash" })}
+    ${statCard("上游协议", "Anthropic Messages", { icon: "fa-plug", iconColor: "text-slate-400",
+        sub: "agent.minimax.cn · Bearer OAuth（自动续签）" })}`;
+
+  const headCount = $("#accHeadCount");
+  if (headCount) headCount.textContent = items.length;
+  const headBreak = $("#accHeadBreak");
+  if (headBreak) headBreak.textContent = `（启用 ${active.length}）`;
+
+  const head = $("#accTableHead");
+  if (head) {
+    head.innerHTML = `${pickAllTh()}<th class="col-name">账号</th><th class="col-status">状态</th>
+      <th class="col-balance text-right">可用积分</th><th class="col-extra text-right">累计发放</th>
+      <th class="col-expiry">凭证</th><th class="col-created">入库时间</th>
+      <th class="col-ops text-right">操作</th>`;
+    setAccOpsWidth(140);
+  }
+  const foot = $("#accFootNote");
+  if (foot) foot.textContent = "可用积分 = credit/details 各包 remaining_amount 求和（签到积分 30 天有效，仅 MiniMax Code 可用）";
+  const footHint = $("#accFootHint");
+  if (footHint) footHint.textContent = "access 票是短周期凭证：到期前自动用 refresh_token 换新（minimax_keepalive 每 6 小时巡检兜底）";
+
+  accServerTabs({ total: items.length,
+    active: active.length,
+    disabled: items.filter(a => a.status !== "active").length });
+
+  if (body) {
+    body.innerHTML = items.map(a => withPick(minimaxRow(a), a.id)).join("") ||
+      `<tr><td colspan="8"><div class="account-empty">
+        <strong>还没有 MiniMax 账号</strong>点上方「扫描本机」（需 MiniMax Code 客户端登录过）或「授权登录」扫码。</div></td></tr>`;
+  }
+  const pager = $("#accPager");
+  if (pager) pager.innerHTML = "";
+  setSideDot("#sideExpiringDot", 0);
+}
+
+function minimaxRow(a) {
+  const ok = a.status === "active";
+  const status = !ok
+    ? '<span class="badge badge-warn">已禁用</span>'
+    : '<span class="badge badge-ok">已启用</span>';
+  const err = (a.last_err && ok)
+    ? `<small style="color:var(--danger)" data-tooltip="最近错误" data-tooltip-description="${esc(a.last_err)}">${esc(String(a.last_err).slice(0, 34))}</small>`
+    : "";
+  let credText = "—", credTone = "var(--fg-muted)", credTip = "";
+  if (a.expires_at_ms) {
+    const left = a.expires_at_ms - Date.now();
+    // access 票是**短周期凭证**（官方约 11 小时一换），不是账号有效期 ——
+    // 按小时展示；到期前 ensure_token / minimax_keepalive 会拿 refresh_token
+    // 自动换新，所以正常状态永远显示「自动续签」，只剩异常（无 refresh）才吓人。
+    const hours = Math.max(0, Math.round(left / 3600e3 * 10) / 10);
+    credText = left <= 0 ? "已过期（待续签）" : `access 票约 ${hours} 小时`;
+    credTip = left <= 0
+      ? "access 票已过期：有 refresh_token 时下一次调用会自动续签"
+      : "access 票为短周期凭证，到期前自动用 refresh_token 换新（无需人工处理）";
+    credTone = left <= 0
+      ? (a.has_refresh ? "var(--warn, #b45309)" : "var(--danger)")
+      : "var(--fg-muted)";
+  }
+  const credNote = a.has_refresh
+    ? `<div><small style="color:${credTone}" data-tooltip="${esc(credTip || "凭证到期前自动续签")}" data-tooltip-description="${esc(credTip || "到期前自动用 refresh_token 换新 access 票")}">${esc(credText)} · 自动续签 ✓</small></div>`
+    : `<div><small style="color:var(--danger)" data-tooltip="没有 refresh_token，access 票过期后无法自动续签" data-tooltip-description="需要重新扫码授权或重新扫描本机凭证入库">无 refresh_token（无法自动续签）</small></div>`;
+
+  return `<tr>
+    <td class="c-name">
+      <div class="nm">
+        <b data-tooltip="${esc(a.name || "未命名")}">${esc(a.name || "未命名")}</b>
+        <span class="c-uid" data-tooltip="MiniMax 用户/凭证标识" data-tooltip-description="${esc(a.uid || "（未提供）")}">${esc((a.uid || "—").slice(0, 12))}</span>
+        <span class="c-uid">${a.realm === "en" ? "国际版" : "中国版"}</span>
+        ${err}
+      </div>
+    </td>
+    <td class="col-status" data-label="状态">${status}</td>
+    <td class="tnum text-right font-medium" data-label="可用积分"
+        style="color:${a.balance_remain > 0 ? "var(--brand)" : "var(--danger)"}">${fmtCredit(a.balance_remain)}</td>
+    <td class="tnum text-right" data-label="累计发放"
+        style="color:var(--fg-muted)">${fmtCredit(a.balance_total)}</td>
+    <td class="col-expiry text-xs" data-label="凭证">${credNote}</td>
+    ${accCreatedCell(a)}
+    <td class="c-ops" data-label="操作">${accOpsHtml(a, [
+      [`minimaxCheckin(${a.id})`, "fa-calendar-check", "立即签到", "grow"],
+      [`minimaxTest(${a.id})`, "fa-heart-pulse", "分段连通性检查", "maintain"],
+      ...commonAccountOps(a),
+    ])}</td>
+  </tr>`;
+}
+
+async function minimaxDelete(id) {
+  const yes = await uiConfirm({ title: "删除 MiniMax 账号",
+                                message: "删除后需要重新「扫描本机」或「授权登录」入库，确定继续？" });
+  if (!yes) return;
+  const r = await api(`/api/minimax/accounts/${id}`, { method: "DELETE" });
+  if (r.ok) { toast("已删除"); accReloadActive(); }
+  else toast("删除失败", "err");
+}
+
+async function minimaxRefresh(id) {
+  const r = await api(`/api/minimax/accounts/${id}/refresh`, { method: "POST" });
+  const { ok, data } = await safeJson(r);
+  if (ok) {
+    toast(`已刷新：可用 ${fmtCredit(data.remain)} / 累计 ${fmtCredit(data.total)}`);
+    accReloadActive();
+  } else {
+    toast((data && data.detail) || "刷新失败", "err");
+  }
+}
+
+async function minimaxCheckin(id) {
+  const r = await api(`/api/minimax/accounts/${id}/checkin`, { method: "POST" });
+  const { ok, data } = await safeJson(r);
+  if (ok) {
+    toast(`签到完成：+${fmtCredit(data.points || 0)} 积分`);
+    accReloadActive();
+  } else {
+    toast((data && data.detail) || "签到失败", "err");
+  }
+}
+
+async function minimaxTest(id) {
+  toast("正在检查（凭证 → 用户 → 对话）…");
+  const r = await api(`/api/minimax/accounts/${id}/test`, { method: "POST" });
+  const { ok, data } = await safeJson(r);
+  if (!ok) { toast((data && data.detail) || "检查失败", "err"); return; }
+  const steps = data.steps || {};
+  const lines = Object.keys(steps).map(k =>
+    `${k}: ${steps[k].ok ? "✓" : "✗"} ${steps[k].message || steps[k].name || ""}`);
+  openModal(`<h3 class="font-semibold text-lg mb-3">连通性检查 · MiniMax #${id}</h3>
     <pre class="text-xs" style="background:var(--surface-2);padding:12px;border-radius:8px">${esc(lines.join("\n"))}</pre>`);
 }
 
@@ -4769,6 +5322,87 @@ async function platformBeginAuth(spec, storage) {
   const realm = (spec && spec.realm) || "cn";
   const id = String((spec && spec.id) || storage || "").toLowerCase();
 
+  // MiniMax Code：官方 OAuth **设备授权流**（与官方客户端同款 PKCE 参数）。
+  // 后端 POST account.minimax.cn/oauth2/device/code 拿 verification_uri_complete，
+  // 前端把它渲染成二维码（手机上确认后凭证自动入库并续期轮换）。
+  if (id === "minimax") {
+    let begin;
+    try {
+      begin = await api("/api/minimax/device/start", { method: "POST" });
+    } catch (e) {
+      toast("开始设备授权失败：" + (e && e.message ? e.message : e), "err");
+      return;
+    }
+    const { ok, data } = await safeJson(begin);
+    if (!ok || !data || !data.auth_id) {
+      toast("开始设备授权失败：" + ((data && data.detail) || "未返回授权会话"), "err");
+      return;
+    }
+    const qrSrc = "/api/minimax/auth/qr.svg?value=" + encodeURIComponent(data.qr_value || "");
+    const authUrl = data.verification_uri_complete || data.verification_uri || "";
+    openModal(`<h3 class="font-semibold text-lg mb-1">扫码授权 · MiniMax Code</h3>
+      <p class="text-xs mb-2" style="color:var(--fg-muted);line-height:1.7">
+        已在新标签<b>自动打开官方授权页</b>（链接已带授权码，无需手填）。<br>
+        <b>①</b> 在页面<b>先用手机号登录</b>（验证码即可；未登录时页面只显示登录框 —— 官方流程如此，不是坏了）<br>
+        <b>②</b> 登录后点页面的「确认授权」→ 本页轮询<b>自动入库并开始自动续签</b>（授权 5 分钟内有效，超时点重试）<br>
+        页面没开出来？<a href="${esc(authUrl)}" target="_blank" rel="noopener" style="color:var(--brand)">手动打开授权页</a>
+        · 或用装了 MiniMax App 且已登录的手机扫码（用户码 <b>${esc(data.user_code || "")}</b>）</p>
+      <div class="flex flex-col items-center gap-3 py-2">
+        <img src="${qrSrc}" alt="授权二维码" width="220" height="220"
+             onerror="this.replaceWith(Object.assign(document.createElement('div'),{style:'width:220px;height:120px;display:flex;align-items:center;justify-content:center;color:var(--danger);font-size:12px;text-align:center;padding:8px;border:1px solid var(--line);border-radius:12px'},{textContent:'二维码渲染失败，请点上方链接手动授权'}))"
+             style="background:#fff;border-radius:12px;padding:8px;border:1px solid var(--line)">
+        <div id="minimaxAuthStatus" class="text-sm" style="color:var(--fg-muted)">等待你在授权页登录并确认…</div>
+      </div>
+      <div class="flex justify-end mt-2">
+        <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button>
+      </div>`, "max-w-sm");
+    // 用户手势内同步打开授权页（带 code），不会被弹窗拦截
+    if (authUrl) window.open(authUrl, "_blank", "noopener");
+    const intervalMs = Math.max(1500, (data.interval || 3) * 1000);
+    const statusEl = () => $("#minimaxAuthStatus");
+    const modalGone = () => {
+      const m = $("#modal");
+      return !m || m.classList.contains("hidden");
+    };
+    const tick = async () => {
+      if (modalGone()) return;
+      let st = null;
+      try {
+        const r = await api("/api/minimax/device/poll?auth_id=" + encodeURIComponent(data.auth_id));
+        st = (await safeJson(r)).data;
+      } catch (e) { /* 网络抖动：下一轮再试 */ }
+      const status = (st && st.status) || "pending";
+      const el = statusEl();
+      if (status === "done") {
+        if (el) { el.textContent = "✅ 授权成功，账号已入库"; el.style.color = "var(--success)"; }
+        toast("MiniMax 授权成功，账号已入库");
+        accReloadActive();
+        window.WBPlatform && window.WBPlatform.refreshCounts && window.WBPlatform.refreshCounts();
+        setTimeout(() => { if (!modalGone()) closeModal(); }, 900);
+        return;
+      }
+      if (status === "denied" || status === "failed" || status === "expired") {
+        const reason = (st && st.error)
+          || (status === "expired" ? "授权已过期（5 分钟）" : "已拒绝或已过期");
+        if (el) {
+          el.innerHTML = "授权未完成：" + esc(reason)
+            + '　<button id="minimaxAuthRetry" class="px-2 py-0.5 rounded border text-xs" style="color:var(--brand)">重新发起授权</button>';
+          el.style.color = "var(--danger)";
+          const retry = document.getElementById("minimaxAuthRetry");
+          if (retry) retry.addEventListener("click", () => {
+            closeModal();
+            platformBeginAuth(window.WBPlatform && window.WBPlatform.spec(), "minimax");
+          });
+        }
+        return;
+      }
+      if (el && status === "pending") el.textContent = "等待授权确认…";
+      setTimeout(tick, intervalMs);
+    };
+    setTimeout(tick, intervalMs);
+    return;
+  }
+
   // 小浣熊：官方 IAM 小程序**扫码授权**（免客户端/免滑块/免短信）。
   // 后端调官方 /api/iam/v1/auth/mp/qrcode 创建会话并返回二维码内容；
   // 用户手机扫码确认后，轮询即拿到已入库的账号 —— 滑块与验证码
@@ -4792,10 +5426,11 @@ async function platformBeginAuth(spec, storage) {
         请用<b>微信</b>或<b>商汤小浣熊 App</b> 扫描下方二维码，并在手机上确认登录。
         确认后凭证自动入库，全程无需客户端与短信验证码。</p>
       <p class="text-[11px] mb-2" style="color:var(--fg-subtle);line-height:1.5">
-        注：上游对扫码会话可能要求 IAM 二次确认（返回 200901）。若提示「未完成确认」，
-        请在客户端登录一次后改用「扫描本机 / 导入文件」入库 —— 那两条路拿到的凭证可直接调用。</p>
+        注：扫码会话若需 IAM 二次确认（200901），服务端会自动补确认后入库；
+        仅当补确认仍失败时才需要改用「扫描本机 / 导入文件」。</p>
       <div class="flex flex-col items-center gap-3 py-2">
         <img src="${qrSrc}" alt="授权二维码" width="220" height="220"
+             onerror="this.replaceWith(Object.assign(document.createElement('div'),{style:'width:220px;height:120px;display:flex;align-items:center;justify-content:center;color:var(--danger);font-size:12px;text-align:center;padding:8px;border:1px solid var(--line);border-radius:12px'},{textContent:'二维码渲染失败（服务端缺 qrcode 库或网关错误），请查看服务日志并重启后重试'}))"
              style="background:#fff;border-radius:12px;padding:8px;border:1px solid var(--line)">
         <div id="raccoonAuthStatus" class="text-sm" style="color:var(--fg-muted)">等待扫码…</div>
       </div>
@@ -5543,11 +6178,35 @@ async function platformScanAll(btn) {
 }
 
 /** 导出全部平台：单文件包含所有平台的备份（或脱敏清单）。 */
-function platformExportAll() {
-  openModal(`<h3 class="font-semibold text-lg mb-1">导出全部平台</h3>
+async function platformExportAll() {
+  // 平台清单（带账号数）：单平台备份用 —— 账号池的「导出」弹窗只覆盖
+  // 当前平台，平台管理页这里是唯一能按平台挑选的地方（2026-11-07）。
+  let items = [];
+  try {
+    const r = await api("/api/platforms");
+    const { ok, data: d } = await safeJson(r);
+    if (ok && Array.isArray(d.items)) items = d.items;
+  } catch (e) { /* 拉不到就只给「全部平台」 */ }
+  const seen = new Set();
+  const options = [{ value: "", label: "全部平台（整机备份）" }]
+    .concat(items
+      .filter(it => (it.account_count || 0) > 0)
+      .map(it => ({
+        // 选项值 = **落库平台名**（storage_platform），后端按它过滤；
+        // 双区平台（qoder = cn+intl 两区）一个值全含。
+        value: it.storage_platform || it.id,
+        label: `${it.label}（${it.account_count} 个账号）`,
+      }))
+      .filter(o => (seen.has(o.value) ? false : (seen.add(o.value), true))));
+  openModal(`<h3 class="font-semibold text-lg mb-1">导出账号数据</h3>
     <p class="text-xs mb-3" style="color:var(--fg-subtle)">
-      把所有平台的账号合并导出一个 JSON。「备份」含明文凭证，可用
+      按平台导出账号 JSON：可选单个平台或全部平台。「备份」含明文凭证，可用
       「导入全部平台」原样回灌；「清单」已脱敏，仅用于核对，不能回灌。</p>
+    <div class="block text-sm mb-3">导出平台
+      ${uiSelectHTML("pexpPlatformSel", {
+        options, value: "", class: "w-full border rounded-lg px-3 py-2 mt-2 text-sm",
+      })}
+    </div>
     <div class="flex gap-2 justify-end mt-3">
       <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">取消</button>
       <button onclick="platformExportAllDownload('plain')"
@@ -5559,13 +6218,19 @@ function platformExportAll() {
 
 async function platformExportAllDownload(mode) {
   try {
-    const r = await api("/api/platforms/export-all?mode=" + encodeURIComponent(mode));
+    // 选项值已是落库平台名（storage_platform），直接传
+    const platform = uiSelectValue("pexpPlatformSel") || "";
+    const r = await api("/api/platforms/export-all?mode=" + encodeURIComponent(mode)
+      + (platform ? "&platform=" + encodeURIComponent(platform) : ""));
     const { ok, data: d } = await safeJson(r);
     if (!ok) { toast("导出失败：" + ((d && d.detail) || r.status), "err"); return; }
     const platforms = (d && d.platforms) || {};
     const count = Object.values(platforms).reduce((s2, p2) => s2 + (p2.count || 0), 0);
+    if (!count) { toast("该平台没有账号可导出", "err"); return; }
+    const scopeTag = d.platform_scope && d.platform_scope !== "all"
+      ? d.platform_scope : "all-platforms";
     await downloadText(
-      `miraihub-all-platforms-${mode === "plain" ? "plain" : "backup"}-${exportStamp()}.json`,
+      `miraihub-${scopeTag}-${mode === "plain" ? "plain" : "backup"}-${exportStamp()}.json`,
       JSON.stringify(d, null, 2), "application/json");
     toast(`已导出 ${count} 个账号（${Object.keys(platforms).length} 个平台）`, "ok");
     closeModal();
@@ -5821,7 +6486,19 @@ async function platformUsageOne(prefix, accountId, name) {
     </tr>`).join("")}</tbody></table></div>`;
 }
 
-/** 各平台的「刷新额度」：**只刷当前平台**的账号。 */
+/** 各平台的「刷新额度」：**只刷当前平台**的账号。
+ *
+ * ## 为什么不再逐个号发请求
+ *
+ * 原实现是 `for (const item of items) await api(`${base}/${id}/refresh`)` ——
+ * 浏览器里就是一串 `refresh` 请求（DevTools 里能看到几十上百条），
+ * 而且**串行**：一个号 1~2 秒，100 个号要几分钟，中途关掉页面就只刷了一半。
+ *
+ * 现在一次 `POST /api/accounts/refresh-batch` 把 id 全交给后端：
+ *  · 后端按平台分派（每个平台走自己的协议）、并发执行（默认 6 路）；
+ *  · 走 `runJob` 进度条，能看到「N/M」与逐号结果，关掉页面后台也会跑完；
+ *  · 失败原因照旧逐号透出（上游原文、本地原因分得清）。
+ */
 async function platformRefreshAll(spec, storage) {
   const base = platformAccountBase(spec, storage);
   const realm = (spec && spec.realm) || "";
@@ -5834,28 +6511,29 @@ async function platformRefreshAll(spec, storage) {
   }
   const items = (data && data.items) || [];
   if (!items.length) { toast("该平台还没有账号", "err"); return; }
-  let total = 0;
-  const failures = [];
-  for (const item of items) {
-    const rr = await api(`${base}/${item.id}/refresh`, { method: "POST" });
-    if (rr.ok) { total += 1; continue; }
-    // 失败要**说清是上游拒绝还是本地问题**：上游 401 的原文是
-    // 「APISIX 401 Authorization Required」，直接弹 401 会让人以为
-    // 控制台登录失效（实测用户就是这么理解的）。
-    let detail = null;
-    try { detail = (await safeJson(rr)).data; } catch (e) {}
-    const up = (detail && detail.detail && detail.detail.upstream) || {};
-    const reason = (up.client_message || (detail && detail.detail && detail.detail.message)
-                    || (detail && detail.detail) || item.message || rr.status);
-    failures.push(`${item.name || ("#" + item.id)}：${reason}`);
-  }
-  toast(`已刷新 ${total}/${items.length} 个账号` + (failures.length
-    ? `；${failures.length} 个失败 —— ${failures[0]}${failures.length > 1 ? " 等" : ""}` : ""),
-    failures.length ? "err" : "ok");
-  loadAccounts();
-  // 平台卡底部的账号数 / 概览卡也要跟着更新（它们不随账号池自动刷新）
-  if (window.WBPlatform) window.WBPlatform.refreshCounts();
-  if (typeof _activeTab !== "undefined" && _activeTab === "platforms") loadPlatformOverview();
+  const ids = items.map(a => Number(a.id)).filter(Boolean);
+
+  await runJob({
+    title: `刷新 ${ids.length} 个账号的额度`,
+    submitUrl: '/api/accounts/refresh-batch',
+    // 显式传 ids：后端据此收窄范围（不会退化成全库）
+    body: { account_ids: ids },
+    label: item => item.account || item.account_id,
+    detail: item => item.reason || '',
+    amount: () => '',
+    icon: item => item.ok
+      ? '<span class="wb-icon text-emerald-500"><svg class="wb-ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></span>'
+      : '<span class="wb-icon text-amber-600"><svg class="wb-ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="10"/></svg></span>',
+    doneText: job => (job.result && job.result.summary) || '刷新完成',
+    summaryHtml: () => '',
+    doneToast: job => (job.result && job.result.summary) || '刷新完成',
+    onFinish: () => {
+      loadAccounts();
+      if (window.WBPlatform) window.WBPlatform.refreshCounts();
+      if (typeof _activeTab !== "undefined" && _activeTab === "platforms") loadPlatformOverview();
+      if (typeof _activeTab !== "undefined" && _activeTab === "credits") loadCreditStats();
+    },
+  });
 }
 
 /**
@@ -7349,12 +8027,14 @@ async function importOne(file){
   const r = await api("/api/accounts/import-local",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({files:[decodeURIComponent(file)]})});
   const d = await r.json().catch(()=>({}));
   if(r.ok){
-    toast(d.skipped ? `该账号已在号池，已跳过` : `已导入 ${d.added||0} 个`,
+    // 接口现在落库即返回，余额由后台线程补；别把 refreshing 说成没成功。
+    toast(d.skipped ? `该账号已在号池，已跳过`
+          : `已导入 ${d.added||0} 个${d.refreshing?' · 余额后台刷新中':''}`,
           d.skipped ? "err" : "ok");
     closeModal(); loadAccounts();
     if (window.WBPlatform) window.WBPlatform.refreshCounts();
   }
-  else toast("导入失败","err");
+  else toast("导入失败" + (d.detail ? "：" + (typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail)) : ""),"err");
 }
 async function importAll(){
   const r = await api("/api/accounts/import-local",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({all:true})});
@@ -7362,12 +8042,14 @@ async function importAll(){
   if(r.ok){
     const parts = [`已导入 ${d.added||0} 个`];
     if(d.skipped) parts.push(`跳过 ${d.skipped} 个重复`);
-    if(d.errors && d.errors.length) parts.push(`${d.errors.length} 个失败`);
+    // errors 现在只含「真的没读进来」的文件；余额刷新失败不再混进来。
+    if(d.errors && d.errors.length) parts.push(`${d.errors.length} 个文件未导入`);
+    if(d.refreshing) parts.push(`余额后台刷新中`);
     toast(parts.join("，"));
     closeModal(); loadAccounts();
     if (window.WBPlatform) window.WBPlatform.refreshCounts();
   }
-  else toast("导入失败","err");
+  else toast("导入失败" + (d.detail ? "：" + (typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail)) : ""),"err");
   if(d.errors) console.warn(d.errors);
 }
 async function refreshAll(){
@@ -8377,7 +9059,9 @@ async function openExport() {
       <span class="text-xs text-slate-400">设成正数可只导前 N 个，处理完再导下一批</span>
     </label>
     <div class="text-sm text-slate-600 mb-3">
-      当前平台账号 <b>${total}</b> 个，其中可用 <b>${active}</b> 个
+      导出范围 = <b>当前平台</b>（顶部所选平台，双区平台含全部区域）+ 下方筛选；
+      共 <b>${total}</b> 个账号，其中可用 <b>${active}</b> 个。
+      要导其它平台：切顶部平台后再导，或到「平台管理 → 导出账号数据」按平台挑选。
       <span class="text-xs text-slate-400">（分批写出，带进度条，不会卡住界面）</span>
     </div>
     <div class="flex justify-between gap-2 mt-4">
@@ -8548,8 +9232,11 @@ async function exportAcc(id, name) {
     const d = await r.json().catch(() => ({}));
     if (!r.ok) { toast("导出失败：" + (d.detail || r.status), "err"); return; }
     const safe = String(name || d.name || d.uid || id).replace(/[\\/:*?"<>|]/g, "_").slice(0, 40);
-    await downloadText(`${safe || "account"}-${id}.info`, JSON.stringify(JSON.parse(d.item), null, 2));
-    toast(`已导出账号「${name || d.name || id}」`, "ok");
+    // WorkBuddy 系 = 加密 .info（可注入客户端）；其它平台 = backup 原文
+    // （auth_json 原样，可直接再导入）——后端按账号平台决定，看响应里的 format。
+    const ext = d.format === 'client' ? '.info' : '.json';
+    await downloadText(`${safe || "account"}-${id}${ext}`, JSON.stringify(JSON.parse(d.item), null, 2));
+    toast(`已导出账号「${name || d.name || id}」${d.format === 'client' ? '' : '（backup 原文）'}`, "ok");
   } catch(error) { toast(error.message || '文件未保存', 'err'); }
 }
 
@@ -8735,19 +9422,20 @@ async function loadShareInfo() {
             // model_id 点一下就能复制 —— 用户经常要「用某个平台的那个 id」。
             // 因为不同平台常有**同名 id**（dfmodel / hy3 这种），
             // 所以每行都标明归属平台，避免复制错。
-            // 多平台同名时，光复制 model_id 分不清落点。这里直接把
-            // 「带平台后缀」的名字作为可复制值（`xxx-workbuddy`），
-            // 用户粘到 model 字段就固定走那个平台，不用再加 header。
-            // 单平台模型没必要加后缀（加了也能用，但名字更长）。
-            const needSuffix = platforms.length > 1;
+            //
+            // 复制的值**一律带平台后缀**（`xxx-workbuddy` / `xxx-loomy`）。
+            // 以前只在多平台同名时才加，单平台模型给裸名 —— 但裸名无法表达
+            // 落点，粘进客户端等于让网关自己挑；带后缀的名字网关同样认
+            // （`model_suffix.resolve` 精确路由），所以统一给全名。
             const detail = platforms.map(p => {
-              const pid = p.platform_id || p.platform;
-              const copyValue = needSuffix ? `${p.model_id}-${pid}` : p.model_id;
+              const callId = p.client_id || modelClientId({
+                model_id: p.model_id, platform: p.platform_id || p.platform });
               return `<div class="model-chip-row">
                 <span>${esc(p.platform_label || p.platform)}</span>
-                <code data-copy-model="${esc(copyValue)}"
-                      data-tooltip="点击复制${needSuffix ? " · 带平台后缀，直接指定该平台" : ""}"
-                >${esc(needSuffix ? copyValue : p.model_id)}</code>
+                <code data-copy-model="${esc(callId)}"
+                      data-tooltip="点击复制 · 带平台后缀，直接指定该平台"
+                      data-tooltip-description="上游原始 id：${esc(p.model_id || "—")}"
+                >${esc(callId)}</code>
                 <span>${p.multiplier == null ? "—"
                   : (Number(p.multiplier) === 0 ? "FREE" : "×" + p.multiplier)}</span>
               </div>`;
@@ -8764,22 +9452,13 @@ async function loadShareInfo() {
                 </div>
                 ${detail || "<div>暂无平台明细</div>"}
                 <div class="model-chip-hint">
-                  点 ID 复制；带平台后缀的名字会**直接路由到该平台**
+                  点 ID 复制；名字带平台后缀，粘进客户端就固定走该平台
                 </div>
               </span>
             </span>`;
           }).join("")
         : '<span class="text-xs text-slate-400">未配置模型白名单（放行全部模型）</span>';
-      if (box) {
-        box.querySelectorAll("[data-copy-model]").forEach(el => {
-          el.addEventListener("click", event => {
-            event.stopPropagation();
-            // copyText() 期望的是**选择器**，不是文本内容 —— 直接传文字
-            // 会让 $(sel) 返回 null，函数静默 return，于是「提示成功但没复制」。
-            copyRawText(el.dataset.copyModel);
-          });
-        });
-      }
+      // 复制事件由 document 上的委派处理器统一接管（见 copyRawText 附近的说明）
     }
   } catch (e) {}
 }
@@ -9573,7 +10252,7 @@ function modelRow(m) {
     ? `<del class="model-original-price">×${info.base.toFixed(2)}</del>` : '';
   return `
     <tr class="border-t hover:bg-slate-50">
-      <td class="px-4 py-3 text-xs"><span class="model-id-line">${modelIcon(m.model_id,'wb-mic-sm')}<span tabindex="0" class="model-id-description" data-model-tooltip="${esc(m.model_id)}" data-tooltip="${esc(m.note || m.model_id)}" data-tooltip-description="${esc(m.model_id)} · ${esc(info.description || '上游暂未提供模型描述')}">${esc(m.note || m.model_id)}</span></span><div class="model-promotion-row">${typeTag}${planTag}${officialTag}${modelPromotionBadges(info)}</div>${(m.note && m.note !== m.model_id) ? `<div style="margin-top:2px;color:var(--fg-subtle);font-size:10px;font-family:ui-monospace,monospace">${esc(m.model_id)}</div>` : ''}${modelCapacityLine(m) ? `<div class="model-capacity-line">${modelCapacityLine(m)}</div>` : ''}</td>
+      <td class="px-4 py-3 text-xs"><span class="model-id-line">${modelIcon(m.model_id,'wb-mic-sm')}<span tabindex="0" class="model-id-description" data-model-tooltip="${esc(m.model_id)}" data-tooltip="${esc(m.note || m.model_id)}" data-tooltip-description="${esc(m.model_id)} · ${esc(info.description || '上游暂未提供模型描述')}">${esc(m.note || m.model_id)}</span></span>${(m.note && m.note !== m.model_id) ? `<div style="margin-top:2px;color:var(--fg-subtle);font-size:10px">${esc(m.model_id)}</div>` : ''}<code class="model-call-id" data-copy-model="${esc(modelClientId(m))}" data-tooltip="点击复制模型 ID" data-tooltip-description="调用时 model 字段直接写这个名字：带平台后缀，网关据此精确落到该平台（不带后缀会让网关自己挑落点）。上游原始 id：${esc(m.upstream_id || m.model_id)}">${esc(modelClientId(m))}</code><div class="model-promotion-row">${typeTag}${planTag}${officialTag}${modelPromotionBadges(info)}</div>${modelCapacityLine(m) ? `<div class="model-capacity-line">${modelCapacityLine(m)}</div>` : ''}</td>
       <td class="px-4 py-3 text-xs">${platformBadge(m.platform)}</td>
       <td class="px-4 py-3 model-mult-column">${original}${multDisplay}</td>
       <td class="px-4 py-3 whitespace-nowrap model-busy-column">${
@@ -9853,7 +10532,11 @@ async function renderAggregatedModels() {
     // 之前只有聚合行有描述，平台明细里只有一个 model_id，鼠标移上去什么也没有。
     const chips = platforms.map(p => {
       const desc = (p.description || "").trim();
-      const tip = `${p.platform_label || p.platform} · ${p.model_id}`;
+      // 可复制的是**完整调用名**（带平台后缀）。只有单平台模型以前不带后缀，
+      // 复制过去等于让网关自己猜落点；现在任何平台都带（后端给 `client_id`）。
+      const callId = p.client_id || modelClientId({
+        model_id: p.model_id, platform: p.platform_id || p.platform });
+      const tip = `${p.platform_label || p.platform} · ${callId}`;
       const note = (p.note || "").trim();
       const meta = [
         desc,
@@ -9862,6 +10545,8 @@ async function renderAggregatedModels() {
           ? (Number(p.multiplier) === 0 ? "倍率：免费" : `倍率：×${p.multiplier}`) : "",
         note ? `备注：${note}` : "",
         p.enabled === false ? "状态：已禁用" : "",
+        `上游原始 id：${p.model_id || "—"}`,
+        "点 ID 复制，带平台后缀的名字直接路由到该平台",
       ].filter(Boolean).join("\n");
       // 倍率 -1 是「该平台没有倍率概念」（Loomy 纯计量）——显示成 `×-1`
       // 会像是坏数据，这里直接不显示。
@@ -9873,7 +10558,7 @@ async function renderAggregatedModels() {
          data-tooltip="${esc(tip)}"
          data-tooltip-description="${esc(meta)}">
         <b>${esc(p.platform_label || p.platform)}</b>
-        <code style="opacity:.7">${esc(p.model_id)}</code>
+        <code style="opacity:.75" data-copy-model="${esc(callId)}">${esc(callId)}</code>
         ${mult ? `<span style="opacity:.6">${esc(mult)}</span>` : ""}
       </span>`;
     }).join("");
@@ -9893,6 +10578,8 @@ async function renderAggregatedModels() {
       <td class="px-4 py-3">${chips}</td>
     </tr>`;
   }).join("");
+  // 聚合视图的行也是整块重绘的：移动端同样要补一次卡片标记
+  refreshMobileCardsSoon();
 }
 
 async function loadModels(){
@@ -10022,7 +10709,8 @@ function renderModelPage(p) {
     if (!term) return true;
     const iconKey = modelIconKey(m.model_id || "");
     const haystack = [
-      m.model_id, m.note, m.description, m.platform, m.platform_label,
+      m.model_id, modelClientId(m), m.upstream_id, m.note, m.description,
+      m.platform, m.platform_label,
       m.level, m.model_type,
       iconKey,
       (m.tags || []).join(" "),
@@ -10061,6 +10749,8 @@ function renderModelPage(p) {
   const officialNote = officialHidden > 0
     ? `<span class="model-official-note" data-tooltip="官方客户端前端当前不显示这些模型（不在 cli agent 名单内）。关闭「官方同显」可查看它们">已按官方同显隐藏 ${officialHidden} 个旧模型</span>` : '';
   $("#modelPager").innerHTML = officialNote + pagerHtml(total, p, totalPages, "renderModelPage");
+  // 行是刚重建的：移动端要重新补卡片标记（否则翻页后又变回挤在一起的表格）
+  refreshMobileCardsSoon();
 }
 async function syncModels(){
   // 按当前平台同步：不传 platform 会同步全部平台（慢，且日志里混在一起）。
@@ -11985,52 +12675,137 @@ function showScheduleResult(id){
     return;
   }
 
-  // 概览行：把标量字段挑出来展示（跳过 detail/errors 这类复杂字段）
-  const skip = new Set(["detail","errors","failed_accounts","task"]);
-  const kv = Object.entries(obj).filter(([k,v]) =>
-      !skip.has(k) && (typeof v !== "object" || v === null));
-  const ovHtml = kv.length ? `<div class="grid grid-cols-2 md:grid-cols-3 gap-2 mb-3">
+  // 概览行：只挑**标量**字段（明细数组单独画表）。
+  // 键名翻成中文 —— 直接暴露 `skipped_already` / `detail_truncated` 这种
+  // 内部字段名，用户看不出是什么（截图里就是一整屏英文键）。
+  const FIELD_LABELS = {
+    ok: "结果", platform: "平台", realm: "区域", total: "账号数",
+    claimed: "新领取", skipped_already: "今日已领", failed: "失败",
+    failed_count: "失败", credit: "获得积分", already: "今日已领",
+    granted: "新领取", elapsed_s: "耗时(秒)", activity_ended: "活动已结束",
+    detail_truncated: "明细已截断", checked_at: "采集时间",
+    // ---- 积分口径（2026-11-06 新增）----
+    // 只报「新领取 0」会让人以为白跑了一轮；用户真正要的是
+    // 「这 101 个号今天一共有多少签到权益」。
+    quota_total: "今日权益合计", quota_granted: "本轮新到账",
+    quota_already: "今日已领部分", credits: "到账积分",
+    daily_quota: "每日额度", skipped: "跳过", renewed: "已续期",
+    renewable: "可续期", anchored: "补锚点", probed: "探活成功",
+    refreshed: "刷新成功", done: "完成", model: "使用模型",
+    no_password: "无密码", expiring_count: "即将到期",
+  };
+  // 金额类字段统一加千分位（505000 读不出是五十万）
+  const MONEY_KEYS = /(credit|quota|balance|total_points)$/;
+  const skip = new Set(["detail", "items", "errors", "failed_accounts", "task",
+                        "summary", "note", "rows", "results"]);
+  const kv = Object.entries(obj).filter(([k,v]) => {
+    if (skip.has(k)) return false;
+    if (typeof v === "object" && v !== null) return false;
+    if (k === "ok") return false;           // 结果用颜色标签表达，不必占一格
+    return true;
+  });
+  // 值的渲染：布尔 → 是/否（别把 `true` 直接丢到界面上）；
+  // 时间戳 → 统一北京时间（`2026-11-06T06:27:11.718215` 那种原始串没法读）。
+  const showValue = (key, value) => {
+    if (typeof value === "boolean") return value ? "是" : "否";
+    if (/(_at|time)$/.test(key) && typeof value === "string" && value) {
+      const pretty = fmtTime(value.replace("T", " ").slice(0, 19));
+      if (pretty && pretty !== value) return pretty;
+    }
+    // 积分/额度类加千分位：5000 → 5,000，505000 → 505,000
+    if (MONEY_KEYS.test(key) && value !== "" && value != null && !isNaN(Number(value))) {
+      return Number(value).toLocaleString("zh-CN");
+    }
+    return String(value);
+  };
+  const ovHtml = kv.length ? `<div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
       ${kv.map(([k,v]) => `<div class="bg-slate-50 rounded-lg px-3 py-2">
-        <div class="text-[11px] text-slate-400">${esc(k)}</div>
-        <div class="text-sm font-medium text-slate-700">${esc(String(v))}</div>
+        <div class="text-[11px] text-slate-400">${esc(FIELD_LABELS[k] || k)}</div>
+        <div class="text-sm font-medium text-slate-700">${esc(showValue(k, v))}</div>
       </div>`).join("")}
     </div>` : "";
 
-  // 摘要单独突出显示
+  // 摘要单独突出显示（成功绿 / 有失败黄）
+  const badCount = Number(obj.failed_count ?? (Array.isArray(obj.failed) ? obj.failed.length : obj.failed)) || 0;
   const sumHtml = obj.summary
-    ? `<div class="mb-3 text-sm bg-emerald-50 text-emerald-800 rounded-lg px-3 py-2">
+    ? `<div class="mb-3 text-sm rounded-lg px-3 py-2 ${badCount ? "bg-amber-50 text-amber-800" : "bg-emerald-50 text-emerald-800"}">
          ${esc(String(obj.summary))}</div>` : "";
 
-  // 逐账号明细表（签到/成长任务最关键的信息）
+  // 逐账号明细：detail / items / rows 都接受（各平台历史字段名不统一）
+  const detailSrc = Array.isArray(obj.detail) ? obj.detail
+                  : Array.isArray(obj.items) ? obj.items
+                  : Array.isArray(obj.rows) ? obj.rows : [];
   let detailHtml = "";
-  if(Array.isArray(obj.detail) && obj.detail.length){
-    const rows = obj.detail.map(d => {
-      const ok = d.ok;
+  if(detailSrc.length){
+    const rows = detailSrc.map(d => {
+      const ok = d.ok !== false;
       const icon = ok
         ? '<span class="wb-icon text-emerald-500"><svg class="wb-ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg></span>'
         : '<span class="wb-icon text-red-500"><svg class="wb-ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg></span>';
-      const credit = d.credit ? `<span class="text-amber-600 font-medium">+${d.credit}</span>` : "—";
+      const creditVal = Number(d.credit);
+      // 状态：各平台字段名不统一 —— WorkBuddy/Trae 给 `status`，
+      // Loomy 只给 `already_processed` 布尔。统一推导，别留空列。
+      const statusKey = String(d.status || "").trim()
+        || (d.already_processed ? "already"
+            : (d.ok === false ? "failed" : "claimed"));
+      const statusText = String(d.status_text || "").trim()
+        || {
+        claimed: "已领取", already: "今日已领", failed: "失败",
+        error: "异常", event_ended: "活动结束", done: "已完成",
+        skipped: "跳过", refreshed: "已刷新",
+      }[statusKey] || statusKey;
+      // 积分列：`credit` 是「本轮新到账」（已领过就是 0），
+      // `daily_quota` 是「今天这张票的签到权益」。
+      // 原来只有 credit，已领过的号就显示「—」—— 用户的原话是
+      // 「逐账号结果都是空的我无法确保账号积分有真实获取到签到权益」。
+      // 现在两列都画：新到账有就 +N，没就显示「今日额度 N」。
+      const quotaVal = Number(d.daily_quota || 0);
+      let credit;
+      if (creditVal > 0) {
+        credit = `<span class="text-amber-600 font-medium">+${creditVal.toLocaleString("zh-CN")}</span>`;
+      } else if (quotaVal > 0) {
+        credit = `<span class="text-slate-500" data-tooltip="今日额度已领取" data-tooltip-description="这个号今天的签到权益已经到账（额度 ${quotaVal.toLocaleString("zh-CN")}），本轮没有新到账。">已领 ${quotaVal.toLocaleString("zh-CN")}</span>`;
+      } else {
+        credit = "—";
+      }
+      const reason = d.reason || d.error || "";
+      const balance = d.current_balance != null
+        ? `<span class="tnum">${Number(d.current_balance).toLocaleString("zh-CN")}</span>`
+        : "—";
       return `<tr class="border-t">
         <td class="py-1.5 pr-2">${icon}</td>
         <td class="py-1.5 pr-3 text-slate-700">${esc(String(d.account ?? d.account_id ?? ""))}</td>
+        <td class="py-1.5 pr-3 text-slate-500">${esc(statusText)}</td>
         <td class="py-1.5 pr-3">${credit}</td>
-        <td class="py-1.5 text-slate-600">${esc(String(d.reason ?? ""))}</td>
+        <td class="py-1.5 pr-3 text-right">${balance}</td>
+        <td class="py-1.5 text-slate-600">${esc(String(reason))}</td>
       </tr>`;
     }).join("");
     const trunc = obj.detail_truncated
-      ? `<p class="text-[11px] text-slate-400 mt-1">明细过长，仅显示前 ${obj.detail.length} 条。</p>` : "";
+      ? `<p class="text-[11px] text-slate-400 mt-1">共 ${obj.total ?? "?"} 个账号，明细仅显示前 ${detailSrc.length} 条。</p>` : "";
     detailHtml = `<div class="mb-2">
       <div class="text-xs font-semibold text-slate-500 mb-1">逐账号结果</div>
-      <div class="max-h-64 overflow-auto rounded-lg border">
-        <table class="w-full text-xs"><tbody>${rows}</tbody></table>
+      <div class="max-h-72 overflow-auto rounded-lg border">
+        <table class="w-full text-xs">
+          <thead class="bg-slate-50 text-slate-400"><tr>
+            <th class="py-1.5 px-2 text-left"></th>
+            <th class="py-1.5 px-3 text-left">账号</th>
+            <th class="py-1.5 px-3 text-left">状态</th>
+            <th class="py-1.5 px-3 text-left">积分</th>
+            <th class="py-1.5 px-3 text-right">当前余额</th>
+            <th class="py-1.5 text-left">说明</th>
+          </tr></thead><tbody>${rows}</tbody></table>
       </div>${trunc}</div>`;
   }
 
-  // 失败账号名单（成长任务用它，没有 detail 时也有信息）
+  // 失败清单：`failed` 可能是数字，也可能是明细数组
   let failHtml = "";
-  if(Array.isArray(obj.failed_accounts) && obj.failed_accounts.length && !detailHtml){
+  const failList = Array.isArray(obj.failed) ? obj.failed
+                 : Array.isArray(obj.failed_accounts) ? obj.failed_accounts : [];
+  if(failList.length && !detailHtml){
     failHtml = `<div class="mb-2 text-xs"><span class="text-slate-500">失败账号：</span>
-      <span class="text-red-500">${obj.failed_accounts.map(esc).join("、")}</span></div>`;
+      <span class="text-red-500">${failList.slice(0, 20).map(x =>
+        esc(String(x.account ?? x))) .join("、")}${failList.length > 20 ? " …" : ""}</span></div>`;
   }
   let errHtml = "";
   if(Array.isArray(obj.errors) && obj.errors.length){
@@ -12049,7 +12824,10 @@ function showScheduleResult(id){
     <div class="flex justify-end mt-3"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`);
 }
 async function loadSchedules(){
-  const r = await api("/api/schedules"); if(!r.ok) return; const d = await r.json();
+  // 全局出口与并发：和列表并行拉（60s 内存缓存，几乎零成本）。
+  // 单条任务的「跟随全局」摘要要拿它渲染，不拉就显示成「未配置」。
+  const [r] = await Promise.all([api("/api/schedules"), loadGlobalScheduleProxy()]);
+  if(!r.ok) return; const d = await r.json();
   const previous = new Map(_schedules.map(row => [row.id, row.last_result]));
   const all = d.items||[];
   // 平台作用域：任务本身带 `platform`（落库平台）。切到 Trae 时，
@@ -12063,7 +12841,14 @@ async function loadSchedules(){
     return pa === pb ? (a.id - b.id) : pa.localeCompare(pb);
   });
   const hidden = 0;
-  if (_schedules.some(row => previous.has(row.id) && previous.get(row.id) !== row.last_result)) loadAccounts();
+  // 任务跑完会改余额：只有**真的在看账号池**时才重拉整份列表。
+  // 以前这里无条件 `loadAccounts()` —— 而这个函数在有任务运行时每 4 秒
+  // 自己调一次自己，等于「定时任务页开着 = 每 4 秒拉一遍全量账号」。
+  // 没在看账号池时只需要刷新侧栏那个到期角标（两个 COUNT）。
+  if (_schedules.some(row => previous.has(row.id) && previous.get(row.id) !== row.last_result)) {
+    if (typeof _activeTab !== "undefined" && _activeTab === "accounts") loadAccounts();
+    else refreshShellBadges();
+  }
   clearTimeout(_schedulePollTimer);
   if(_schedules.some(s => { try { return JSON.parse(s.last_result||"{}").running; } catch(e) { return false; } })){
     _schedulePollTimer = setTimeout(() => loadSchedules(), 4000);
@@ -12093,6 +12878,7 @@ async function loadSchedules(){
       hidden > 0
         ? `当前平台没有定时任务（另有 ${hidden} 个属于其它平台，切回对应平台可查看）`
         : "还没有定时任务"}</td></tr>`;
+  refreshMobileCardsSoon();
 }
 async function runSchedule(id){
   if(_scheduleRequests.has(id)) return;
@@ -12178,6 +12964,109 @@ function scheduleDetailTable(detail) {
 }
 async function toggleSchedule(id){ await api("/api/schedules/"+id+"/toggle",{method:"POST"}); loadSchedules(); }
 async function delSchedule(id){ if(!await uiConfirm({message:"确认删除该任务？", title:"删除定时任务"}))return; const r=await api("/api/schedules/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"失败",r.ok?"ok":"err"); if(r.ok) loadSchedules(); }
+/**
+ * 出口代理与并发配置块（2026-11-06）。
+ *
+ * 为什么这几个字段必须能配：
+ *   一个出口 IP 上跑几十个号会被上游拉黑；池子几百上千时更必须分散。
+ *   但「并发多少」不能拍脑袋 —— 每个出口能承受几个并发是**出口自己的
+ *   属性**（住宅 1~2，机房 5~10），所以默认留给「自动」（= 各节点
+ *   max_concurrency 之和）。
+ *
+ * 另外两个字段解决「余额刷新卡死」：
+ *   · 时间预算：到点就停，剩下的下一轮继续，**不追求一轮刷完**；
+ *   · stale 阈值：只刷超过 N 分钟没更新的号，刚刷过的直接跳过。
+ */
+function scheduleProxyHTML(data){
+  const pool = data.proxy_pool || "";
+  const conc = Number(data.concurrency || 0);
+  const budget = Number(data.time_budget_minutes || 0);
+  const stale = Number(data.stale_minutes || 0);
+  // 全局默认摘要（2026-11-07）：任务级留空/0 的字段实际生效的是全局值，
+  // 不写出来用户无从知道「这条任务现在到底从哪出去」。
+  const g = _scheduleGlobal || {};
+  const gPool = String(g.proxy_pool || "");
+  const gDesc = gPool ? `代理组 ${gPool}` : (Number(g.concurrency || 0) ? `并发 ${Number(g.concurrency)}` : "直连");
+  return `<details class="schedule-help" ${pool||conc||budget||stale ? "open" : ""}>
+    <summary><i class="fa-solid fa-network-wired" aria-hidden="true"></i>出口代理与并发 <span class="schedule-zone">${
+      pool ? "代理组 " + esc(pool) : (conc ? "并发 " + conc : "跟随全局（" + esc(gDesc) + "）")
+    }</span></summary>
+    <div class="schedule-field"><label for="scProxyPool">代理组 <span class="schedule-zone">可选</span></label>
+      <input id="scProxyPool" placeholder="留空 = 跟随全局默认（当前：${esc(gPool || "直连")}）；填 proxy_endpoints.pool 里的组名" value="${esc(pool)}" />
+      <p class="schedule-hint">在「代理节点」里配好出口后，这里填组名即可让本任务走代理。留空时生效的是「全局出口与并发」里的默认值。检测到 IP 被拉黑时该节点会自动静默 30 分钟，其它节点继续。</p></div>
+    <div class="schedule-field"><label for="scConc">并发数 <span class="schedule-zone">0 = 自动</span></label>
+      <input id="scConc" type="number" min="0" max="64" step="1" value="${conc}" />
+      <p class="schedule-hint">自动 = 各可用代理节点的 max_concurrency 之和（没配代理时用 4）。留空/0 时先生效全局默认，再落到自动。住宅代理建议 1~2，机房可以 5~10。</p></div>
+    <div class="schedule-field"><label for="scBudget">单轮时间预算（分钟） <span class="schedule-zone">0 = 默认 8</span></label>
+      <input id="scBudget" type="number" min="0" max="720" step="1" value="${budget}" />
+      <p class="schedule-hint">到点就停、本轮未完成的下一轮接着刷。几千个号时不要指望一轮刷完，否则就成了「无限循环」。0 时先生效全局默认。</p></div>
+    <div class="schedule-field"><label for="scStale">只刷超过 N 分钟没更新的号 <span class="schedule-zone">0 = 默认 60</span></label>
+      <input id="scStale" type="number" min="0" max="10080" step="1" value="${stale}" />
+      <p class="schedule-hint">刚刷过的号直接跳过。没有这一条，大池子每轮全量重扫永远刷不完。0 时先生效全局默认。</p></div>
+  </details>`;
+}
+
+/* ---- 全局出口代理与并发（2026-11-07）----
+ * 单个任务上的配置保留不动；这里是「没单独配的任务统一吃这套默认」。
+ * 优先级：任务显式配置 > 全局默认 > 环境变量 > 内置默认。
+ */
+let _scheduleGlobal = null;
+let _scheduleGlobalAt = 0;
+
+async function loadGlobalScheduleProxy(force) {
+  if (!force && _scheduleGlobal && Date.now() - _scheduleGlobalAt < 60000) return _scheduleGlobal;
+  try {
+    const { ok, data } = await safeJson(await api("/api/schedules/global-proxy"));
+    if (ok && data) { _scheduleGlobal = data; _scheduleGlobalAt = Date.now(); }
+  } catch (e) { /* 拉不到就按「未配置全局」渲染 */ }
+  return _scheduleGlobal;
+}
+
+function openGlobalScheduleProxy(){
+  loadGlobalScheduleProxy(true).then(g => {
+    g = g || {};
+    openModal(`
+    <div class="schedule-form">
+    <header class="schedule-form-head"><span class="schedule-form-icon"><i class="fa-solid fa-network-wired" aria-hidden="true"></i></span><div><h3>全局出口与并发</h3><p>所有「没单独配置」的定时任务统一吃这套默认；单个任务里填了值仍以任务为准</p></div></header>
+    <div class="schedule-field"><label for="gProxyPool">默认代理组 <span class="schedule-zone">可选</span></label>
+      <input id="gProxyPool" placeholder="留空 = 直连；填 proxy_endpoints.pool 里的组名" value="${esc(String(g.proxy_pool || ""))}" />
+      <p class="schedule-hint">在「代理节点」里配好出口后填组名。一个出口 IP 上跑几十个号会被上游拉黑；配好后所有余额刷新/签到任务自动分散到该组节点。</p></div>
+    <div class="schedule-field"><label for="gConc">默认并发数 <span class="schedule-zone">0 = 自动</span></label>
+      <input id="gConc" type="number" min="0" max="64" step="1" value="${Number(g.concurrency || 0)}" />
+      <p class="schedule-hint">自动 = 各可用代理节点的 max_concurrency 之和（没配代理时用 4）。住宅代理建议 1~2，机房可以 5~10。</p></div>
+    <div class="schedule-field"><label for="gBudget">默认单轮时间预算（分钟） <span class="schedule-zone">0 = 内置 8</span></label>
+      <input id="gBudget" type="number" min="0" max="720" step="1" value="${Number(g.time_budget_minutes || 0)}" />
+      <p class="schedule-hint">到点就停、本轮未完成的下一轮接着刷，不追求一轮刷完。</p></div>
+    <div class="schedule-field"><label for="gStale">默认只刷超过 N 分钟没更新的号 <span class="schedule-zone">0 = 内置 60</span></label>
+      <input id="gStale" type="number" min="0" max="10080" step="1" value="${Number(g.stale_minutes || 0)}" />
+      <p class="schedule-hint">刚刷过的号直接跳过，大池子才刷得完。</p></div>
+    <footer class="schedule-form-actions">
+      <button type="button" onclick="closeModal()" class="console-btn">取消</button>
+      <button type="button" onclick="submitGlobalScheduleProxy()" class="console-btn primary">保存全局默认</button>
+    </footer></div>`, 'max-w-lg');
+  });
+}
+
+async function submitGlobalScheduleProxy(){
+  const body = {
+    proxy_pool: ($("#gProxyPool") ? $("#gProxyPool").value.trim() : ""),
+    concurrency: Math.max(0, Math.min(64, Number($("#gConc") && $("#gConc").value) || 0)),
+    time_budget_minutes: Math.max(0, Math.min(720, Number($("#gBudget") && $("#gBudget").value) || 0)),
+    stale_minutes: Math.max(0, Math.min(10080, Number($("#gStale") && $("#gStale").value) || 0)),
+  };
+  try {
+    const { ok, data } = await safeJson(await api("/api/schedules/global-proxy", {
+      method: "PUT", body: JSON.stringify(body),
+    }));
+    if (!ok) { toast("保存失败: " + ((data && data.detail) || ""), "err"); return; }
+    _scheduleGlobal = data; _scheduleGlobalAt = Date.now();
+    closeModal();
+    toast("全局出口与并发已保存，下一轮任务执行即生效", "ok");
+    loadSchedules();
+  } catch (e) { toast("保存异常: " + e.message, "err"); }
+}
+
+
 function scheduleTimingHTML(data){
   const timing = data.timing || {mode:'preset', time:'09:00', weekdays:[0], monthday:1};
   const modes = [['preset','系统预设'],['interval','固定间隔'],['daily','每天'],['weekly','每周'],['monthly','每月']];
@@ -12220,7 +13109,8 @@ function scheduleForm(title, data){
     ${uiSelectHTML("scTask", { value: String(data.task || (tasks[0] && tasks[0][0]) || ""),
         options: taskOpts, onChange: () => onTaskChange() })}</div>
     ${scheduleTimingHTML(data)}
-    <details class="schedule-help"><summary><i class="fa-regular fa-circle-question" aria-hidden="true"></i>成长计划执行说明</summary><p>成长计划建议每 60 分钟巡检：逐账号补每日活跃、签到、领取旅行礼物、兑换连登奖励并使用免费抽奖次数。每天最多一次成功活跃对话；每日最多开启一批盲盒（5个以内，消耗已有能量）、抽奖5次。进度持久化，重复运行会跳过已完成项。</p></details>
+    ${scheduleProxyHTML(data)}
+    <details class="schedule-help"><summary><i class="fa-regular fa-circle-question" aria-hidden="true"></i>成长计划执行说明</summary><p>成长计划建议每 60 分钟巡检：逐账号补每日活跃、签到、领取旅行礼物、兑换连登奖励并使用免费抽奖次数。每天最多一次成功活跃对话；每日最多开启一批盲盒（5 个以内，消耗已有能量）、抽奖 5 次。进度持久化，重复运行会跳过已完成项。</p></details>
     <div id="scStopWrap" class="${isCheckin?'':'hidden'}">
       <div class="schedule-field"><label for="scStopButton">停止领取时间 <span class="schedule-zone">可选 · 本地时间</span></label>
       <input id="scStop" aria-label="停止领取时间" type="datetime-local" value="${saVal}" />
@@ -12333,6 +13223,11 @@ async function submitSchedule(id){
     // 平台专属任务必须带 platform：后端按它找 gateway 的 runner
     platform: taskPlatformOf(pickedTask) || undefined,
     interval_minutes:Number($("#scIv").value)*Number(uiSelectValue("scUnit")), enabled:$("#scEnabled").checked?1:0, stop_after: stopRaw || null,
+    // 出口代理与并发（余额刷新/签到靠它分散 IP 并控制节奏）
+    proxy_pool: ($("#scProxyPool") ? $("#scProxyPool").value.trim() : ""),
+    concurrency: ($("#scConc") ? Math.max(0, Math.min(64, Number($("#scConc").value) || 0)) : 0),
+    time_budget_minutes: ($("#scBudget") ? Math.max(0, Math.min(720, Number($("#scBudget").value) || 0)) : 0),
+    stale_minutes: ($("#scStale") ? Math.max(0, Math.min(10080, Number($("#scStale").value) || 0)) : 0),
     timing:{mode:uiSelectValue("scCycle"), time:$("#scTime").value || '09:00', monthday:Number($("#scMonthday").value), weekdays:[...document.querySelectorAll('[name=scWeekday]:checked')].map(el=>Number(el.value))} };
   if(!body.timing.weekdays.length && body.timing.mode === 'weekly'){ toast('请至少选择一周中的一天','err'); return; }
   if(!body.timing.weekdays.length) body.timing.weekdays = [0];
@@ -12481,15 +13376,22 @@ function _logLiveRenderPlatforms(platforms) {
   if (!counts || !platforms) return;
   counts.innerHTML = platforms.map(row => {
     const total = Number(row.requests || 0);
+    // 失败 = 真失败 + 超时。**不含 `interrupted`**：
+    // 那是「200 已经发出去了，客户端自己先断开」（用户点了停止、
+    // 客户端拿够内容就挂断、工具调用已拿到结果）。把它算失败时，
+    // 面板上会出现「Loomy 306 请求 · 306 失败」，而每条都是 200。
     const failed = Number(row.error || 0) + Number(row.timeout || 0);
-    // 结构：左「平台名」+ 右「数字 [失败N]」。
+    const interrupted = Number(row.interrupted || 0);
+    // 结构：左「平台名」+ 右「数字 [失败N] [中断N]」。
     // **失败数必须是独立一块**，不能和总数挤在同一段文本里 ——
     // 之前写成 `29 11 失败`，两者之间只有一个空格，窄屏下会连成一片。
-    return `<div class="live-platform-count" data-tooltip="${esc(row.label || row.platform)} · 最近 1 小时">
+    return `<div class="live-platform-count" data-tooltip="${esc(row.label || row.platform)} · 最近 1 小时"
+        data-tooltip-description="失败：上游报错 / 5xx / 准入拒绝 · 超时：未按时收到响应 · 中断：响应已返回（通常是 200）但客户端提前断开，不算失败">
       <span class="lpc-name">${esc(String(row.label || row.platform).replace(/\s*(国内版|国际版|中国版)/, ""))}</span>
       <span class="lpc-values">
         <b class="lpc-total">${total}</b>
         ${failed ? `<em class="lpc-fail" data-tooltip="失败（错误 + 超时）">${failed} 失败</em>` : ""}
+        ${interrupted ? `<em class="lpc-cut" data-tooltip="客户端提前断开（响应已发出）">${interrupted} 中断</em>` : ""}
       </span>
     </div>`;
   }).join("");
@@ -12529,6 +13431,10 @@ function _logLiveRow(item) {
     label = STAGE_TEXT[stage] || "进行中";
   } else if (item.outcome === "timeout") {
     label = "超时";
+  } else if (item.outcome === "interrupted" && status && status < 400) {
+    // 200 但流没收完 = 客户端先断开。显示「200 中断」而不是只写 200 ——
+    // 既保留真实状态码，也把「这条没跑完」讲清楚，别让它看起来像失败。
+    label = status + " 中断";
   } else {
     label = status ? String(status) : (item.outcome || "—");
   }
@@ -12601,6 +13507,9 @@ function startLogLive() {
   const url = "/api/sentinel/traffic/stream?window=3600";
   const source = new EventSource(url);
   _logLiveSource = source;
+  // 首帧就是全量快照：连上即视为「实时」，别让顶部那行小字一直停在
+  // 「正在连接实时通道…」（用户会以为没生效，然后去手动刷新）。
+  source.onopen = () => setLogRealtimeHint("实时推送已连接");
 
   source.onmessage = (event) => {
     let payload;
@@ -12620,8 +13529,7 @@ function startLogLive() {
   };
 
   source.onerror = () => {
-    const hint = $("#logLiveHint");
-    if (hint) hint.textContent = "实时通道断开，正在重连…";
+    setLogRealtimeHint("实时通道断开，正在重连…");
     // EventSource 自带重连；连续失败时它自己会放弃，这里不做额外处理
   };
 }
@@ -12639,12 +13547,18 @@ function startLogLive() {
 
 function startLogUsageStream() {
   stopLogUsageStream();
-  if (document.documentElement.dataset.activeTab !== 'logs' || !TOKEN) return;
+  // ⚠️ **不能**判 `TOKEN`。
+  //
+  // 令牌搬进 HttpOnly Cookie 之后 `TOKEN` 恒为空字符串（浏览器里连登录都不再
+  // 存它），可这里原来写的是 `|| !TOKEN` —— 于是这条 SSE 永远在入口处
+  // return，日志表格只能靠手动刷新。用户看到的就是「数据不是实时的了」。
+  // 推送端点用同源 Cookie 鉴权（票据也是用 Cookie 换的），不需要任何 JS 可读的令牌。
+  if (document.documentElement.dataset.activeTab !== 'logs') return;
   if (typeof EventSource === 'undefined') {
     // 极老 WebView 没有 EventSource：退回 8 秒轮询，至少不会完全静止
     const tick = async () => {
       _logUsagePollTimer = null;
-      if (document.documentElement.dataset.activeTab !== 'logs' || !TOKEN) return;
+      if (document.documentElement.dataset.activeTab !== 'logs') return;
       try {
         const r = await api('/api/logs/requests?include_history=false');
         const { ok, data } = await safeJson(r);
@@ -12675,10 +13589,14 @@ function startLogUsageStream() {
       return;
     }
     _logUsageSource = src;
+    src.addEventListener('open', () => {
+      setLogRealtimeHint('实时推送已连接');
+    });
     src.addEventListener('usage', event => {
       let rev = null;
       try { rev = JSON.parse(event.data).usage_revision; } catch (e) { /* ignore */ }
       if (rev != null) _logUsageRevision = rev;
+      setLogRealtimeHint('实时推送已连接');
       refreshLogTable();
     });
     src.addEventListener('reauth', () => {
@@ -12691,12 +13609,22 @@ function startLogUsageStream() {
     src.onerror = () => {
       // EventSource 自己会重连；这里只在彻底关闭时补一次
       if (src.readyState === 2) {
+        setLogRealtimeHint('实时通道断开，正在重连…');
         clearTimeout(_logUsageReconnect);
         _logUsageReconnect = setTimeout(open, 3000);
       }
     };
   };
   open();
+}
+
+/** 实时通道的状态提示（日志页顶部那行小字）。没这一行，断流时用户不知道。 */
+function setLogRealtimeHint(text) {
+  const hint = $("#logLiveHint");
+  if (!hint) return;
+  if (hint.dataset.state === text) return;
+  hint.dataset.state = text;
+  hint.textContent = text;
 }
 
 function stopLogUsageStream() {
@@ -12724,7 +13652,9 @@ function refreshLogTable() {
 }
 
 function startLogActivity() {
-  if (document.documentElement.dataset.activeTab !== 'logs' || !TOKEN) return;
+  // 同上：令牌在 HttpOnly Cookie 里，`TOKEN` 恒为空 —— 判它等于「永远不连 SSE」，
+  // 整个日志页因此退化成「只有打开时那一次请求」，必须手动刷新才有新数据。
+  if (document.documentElement.dataset.activeTab !== 'logs') return;
   // 两条独立 SSE：上方「请求动态」、下方「用量日志表格」
   startLogUsageStream();
   startLogLive();
@@ -13019,6 +13949,8 @@ async function loadLogs(page, silent = false) {
     `<tr><td colspan="${_logColCount()}"><div class="empty">${
       conds.length ? "当前筛选条件下没有记录，试试放宽时间范围或清除筛选" : "还没有请求记录（代理产生调用后这里会出现）"
     }</div></td></tr>`;
+  // 移动端：日志表每次筛选 / 翻页都整块重绘，卡片标记要跟着补
+  refreshMobileCardsSoon();
 
   $("#logPager").innerHTML = total != null
     ? pagerHtml(total, _logPage, totalPages, "loadLogs")
@@ -13161,6 +14093,8 @@ function renderLogRows() {
       (_logLastConds || []).length ? "当前筛选条件下没有记录，试试放宽时间范围或清除筛选"
         : "还没有请求记录（代理产生调用后这里会出现）"
     }</div></td></tr>`;
+  // 日志表一页 20 行、每次筛选/翻页整块重绘：移动端要重新卡片化
+  refreshMobileCardsSoon();
 }
 
 /** 用途列的可读短名。
@@ -13193,7 +14127,7 @@ function logRow(l) {
        </div>`
     : `<span class="text-xs" style="color:var(--fg-subtle)">—</span>`;
   const credHtml = l.credits>0
-    ? `<span class="text-emerald-600 font-semibold tnum">${Number(l.credits).toFixed(4)}</span>`
+    ? `<span class="text-emerald-600 font-semibold tnum">${ovCredit(l.credits)}</span>`
     : `<span style="color:var(--fg-subtle)">—</span>`;
   const ttfbColor = ms => ms==null ? 'var(--fg-subtle)' : ms<=3000 ? 'var(--ok)' : ms<=8000 ? '#d97706' : ms<=20000 ? 'var(--warn)' : 'var(--danger)';
   const totalColor = ms => ms==null ? 'var(--fg-subtle)' : ms<=15000 ? 'var(--ok)' : ms<=30000 ? '#d97706' : ms<=60000 ? 'var(--warn)' : 'var(--danger)';
@@ -13344,7 +14278,7 @@ async function loadLogSummary(silent = false) {
     if (usageRevision === _logUsageRevision) _logSummaryDirty = false;
     _logSummarySignature = filterSignature;
     _logSummaryAt = Date.now();
-    if (hint) hint.textContent = `当前筛选 · ${data.account_count} 个账号 · 成功 ${data.ok_requests} / 错误 ${data.failed_requests} · ${fmtCredit(data.total_credits)} 积分${data.unattributed_requests ? ` · ${data.unattributed_requests} 次未记录账号 / 未选号` : ""}`;
+    if (hint) hint.textContent = `当前筛选 · ${data.account_count} 个账号 · 成功 ${data.ok_requests} / 错误 ${data.failed_requests} · ${ovCredit(data.total_credits)} 积分${data.unattributed_requests ? ` · ${data.unattributed_requests} 次未记录账号 / 未选号` : ""}`;
     if (!items.length) { box.innerHTML = `<div class="empty">该时间范围内没有账号产生请求。</div>`; return; }
     const maxC = Math.max(1, ...items.map(x => x.credits));
     box.innerHTML = `<table class="tbl" style="min-width:820px">
@@ -13357,7 +14291,7 @@ async function loadLogSummary(silent = false) {
           <td class="font-medium">${esc(x.account_name)}</td>
           <td class="text-right tnum">${fmtNum(x.requests)}</td>
           <td class="text-right tnum" style="color:${x.failed_requests > 0 ? 'var(--danger)' : 'var(--fg-subtle)'}">${x.failed_requests}</td>
-          <td class="text-right tnum font-medium" style="color:var(--warn)">${fmtCredit(x.credits)}</td>
+          <td class="text-right tnum font-medium" style="color:var(--warn)">${ovCredit(x.credits)}</td>
           <td class="text-right tnum" style="color:var(--fg-muted)">${fmtK(x.total_tokens)}</td>
           <td class="text-right tnum font-medium" style="color:${cacheRateOf(x) == null ? 'var(--fg-subtle)' : (cacheRateOf(x) >= 60 ? 'var(--ok)' : cacheRateOf(x) >= 30 ? '#d97706' : 'var(--fg-subtle)')}" data-tooltip="${cacheRateOf(x) == null ? '缓存命中未知' : '缓存命中 ' + fmtK(x.cached_tokens||0) + ' / 输入 ' + fmtK(x.prompt_tokens||0)}" data-tooltip-description="${cacheRateOf(x) == null ? '该平台上游没有返回缓存统计（不是命中率为 0）' : ''}">${cacheRateOf(x) == null ? '—' : cacheRateOf(x).toFixed(2) + '%'}</td>
           <td class="text-right tnum" style="color:var(--fg-muted)">${x.avg_latency_ms ? (x.avg_latency_ms/1000).toFixed(2)+'s' : '—'}</td>
@@ -13409,9 +14343,40 @@ function openLogsPanel() {
   loadLogAccounts().catch(() => {}); loadLogs(1);
 }
 
+/* 日志筛选的候选值：模型 / 平台 / Key。
+ *
+ * ⚠️ 首屏改成「按面板懒加载」之后，直接进日志页时 `_modelData` / `_keyData`
+ * 还没被任何人拉过 —— 以前这里是静态填空，两个下拉就是空的（看着像筛选坏了）。
+ * 这里做**自愈**：
+ *   · 模型：优先用模型配置里的 `model_id`；没加载过就用聚合接口建好的
+ *     `_modelLabelMap`（日志页本来就要拉它做展示名映射，等于零成本）——
+ *     不为一个下拉去拉整份配置（那还带倍率/繁忙/描述）。
+ *   · Key：keys 列表本身很小，补一次即可（失败就空着，不影响主表）。
+ * 只在「确实缺数据」时补一次，补完直接重填，不递归。
+ */
+let _logFilterFilling = false;
 function fillLogFilterOptions(){
-  WBFilterCombobox.attach('logModel', _modelData.map(m => m.model_id));
-  WBFilterCombobox.attach('logKey', _keyData.map(k => k.name));
+  const modelIds = (_modelData || []).length
+    ? _modelData.map(m => m.model_id)
+    : Object.keys(_modelLabelMap || {});
+  WBFilterCombobox.attach('logModel', modelIds);
+  WBFilterCombobox.attach('logKey', (_keyData || []).map(k => k.name));
+  if (_logFilterFilling) return;
+  const needModels = !modelIds.length;
+  const needKeys = !(_keyData || []).length;
+  if (!needModels && !needKeys) return;
+  _logFilterFilling = true;
+  const tasks = [];
+  if (needModels) tasks.push(loadModelLabelMap().catch(() => {}));
+  if (needKeys) tasks.push(loadKeys().catch(() => {}));
+  Promise.all(tasks).then(() => {
+    _logFilterFilling = false;
+    const ids = (_modelData || []).length
+      ? _modelData.map(m => m.model_id)
+      : Object.keys(_modelLabelMap || {});
+    WBFilterCombobox.attach('logModel', ids);
+    WBFilterCombobox.attach('logKey', (_keyData || []).map(k => k.name));
+  }).catch(() => { _logFilterFilling = false; });
 }
 
 async function exportLogs(diagnostics = false){
@@ -13666,11 +14631,31 @@ function fmtInt(n) {
  */
 function donutChart(rows, valueKey, opts) {
   const options = opts || {};
-  const items = (rows || []).filter(r => (r.requests || 0) > 0 || (r[valueKey] || 0) > 0);
-  if (!items.length) return `<div class="text-xs text-slate-400 py-8 text-center">暂无数据</div>`;
+  // Top-N 收敛（2026-11-07）：账号/Key 上千时环形图挤成一坨、图例每行
+  // 占比 0.x% 毫无信息量。超过 topN 时只画大头，剩余合并成「其他 N 项」
+  // 一行灰色兜底。后端 /usage 的 by_account 已经在 SQL 侧收敛过一次，
+  // 这里是所有调用方（积分统计等）共用的最后防线。
+  const topN = Math.max(2, Number(options.top) || 10);
+  let data = (rows || []).filter(r => (r.requests || 0) > 0 || (r[valueKey] || 0) > 0);
+  if (!data.length) return `<div class="text-xs text-slate-400 py-8 text-center">暂无数据</div>`;
+  // 「有没有积分列」必须看**合并前**的行 —— 否则无积分的图（如结果分布）
+  // 一旦触发 Top-N 合并，会凭空多出 Token/积分两列 0。
+  const countsOnly = data.every(r => r.credits === undefined);
+  if (data.length > topN) {
+    const sorted = data.slice().sort((a, b) => (Number(b[valueKey]) || 0) - (Number(a[valueKey]) || 0));
+    const rest = sorted.slice(topN);
+    const sumOf = key => rest.reduce((s, r) => s + (Number(r[key]) || 0), 0);
+    const others = {
+      label: `其他 ${rest.length} 项`,
+      requests: sumOf('requests'),
+      platform_label: "", _others: true,
+    };
+    if (!countsOnly) { others.tokens = sumOf('tokens'); others.credits = sumOf('credits'); }
+    data = sorted.slice(0, topN).concat([others]);
+  }
 
+  const items = data;
   const total = items.reduce((s, r) => s + (r[valueKey] || 0), 0);
-  const countsOnly = items.every(r => r.credits === undefined);
   // 平台列：只有「全部平台」口径才显示 —— 已经按平台筛过时，
   // 每一行都写着同一个平台名，纯噪音。调用方通过 showPlatform 控制。
   const showPlatform = options.showPlatform !== false &&
@@ -13685,8 +14670,8 @@ function donutChart(rows, valueKey, opts) {
     const len = frac * C;
     const pct = (frac * 100).toFixed(1);
     const tip = `<b>${esc(r.label)}</b>${showPlatform && r.platform_label ? ' · ' + esc(r.platform_label) : ''}<br>${valueKey === 'requests' ? '请求 '+fmtNum(r.requests) : '积分 '+fmtCredit(r.credits)}（${pct}%）${countsOnly ? '' : '<br>请求 '+fmtNum(r.requests)+' · Token '+fmtNum(r.tokens)}`;
-    const seg = `<circle class="chart-hit" cx="80" cy="80" r="${R}" fill="none"
-        stroke="${_PIE_COLORS[i % _PIE_COLORS.length]}" stroke-width="${SW}"
+    const seg = `<circle class="chart-hit chart-arc" style="--i:${i};--c:${C.toFixed(1)}" cx="80" cy="80" r="${R}" fill="none"
+        stroke="${r._others ? '#64748b' : _PIE_COLORS[i % _PIE_COLORS.length]}" stroke-width="${SW}"
         stroke-dasharray="${len} ${C - len}" stroke-dashoffset="${-offset}"
         transform="rotate(-90 80 80)"
         onmousemove="showTip(event, ${jsv(tip)})" onmouseleave="hideTip()"></circle>`;
@@ -13697,9 +14682,9 @@ function donutChart(rows, valueKey, opts) {
   const legend = items.map((r, i) => {
     const frac = total ? ((r[valueKey] || 0) / total * 100).toFixed(1) : "0.0";
     return `
-    <tr class="border-t hover:bg-slate-50">
+    <tr class="border-t hover:bg-slate-50" style="--i:${i}">
       <td class="donut-legend-name">
-        <span class="donut-legend-dot" style="background:${_PIE_COLORS[i % _PIE_COLORS.length]}"></span>
+        <span class="donut-legend-dot" style="background:${r._others ? '#64748b' : _PIE_COLORS[i % _PIE_COLORS.length]}"></span>
         <span class="donut-legend-body">
           <span class="donut-legend-text">${esc(r.label)}</span>${platformTag(r)}
         </span>
@@ -13713,7 +14698,7 @@ function donutChart(rows, valueKey, opts) {
 
   return `
     <div class="flex items-center gap-3 donut-legend">
-      <svg viewBox="0 0 160 160" class="w-32 h-32 shrink-0">${arcs}</svg>
+      <svg viewBox="0 0 160 160" class="w-32 h-32 shrink-0 donut-anim">${arcs}</svg>
       <div class="flex-1 min-w-0 max-h-56 overflow-auto">
         <table class="donut-legend-table">
           <colgroup>
@@ -13747,8 +14732,10 @@ function trendChart(rows) {
   const line = (key, color) => {
     const pts = rows.map((r, i) => `${x(i)},${y(r[key])}`).join(" ");
     const area = `${PAD},${H - PAD} ${pts} ${x(n - 1)},${H - PAD}`;
-    return `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" pointer-events="none"></polyline>
-            <polygon points="${area}" fill="${color}" opacity="0.10" pointer-events="none"></polygon>`;
+    // pathLength=1 把折线长度归一化，CSS 里 stroke-dasharray:1 +
+    // dashoffset 1→0 就是「从左往右描线」的入场动画（wbLineIn）。
+    return `<polyline class="trend-line" pathLength="1" points="${pts}" fill="none" stroke="${color}" stroke-width="2" pointer-events="none"></polyline>
+            <polygon class="trend-area" points="${area}" fill="${color}" opacity="0.10" pointer-events="none"></polygon>`;
   };
 
   const grid = [0, 0.25, 0.5, 0.75, 1].map(f => {
@@ -13767,8 +14754,8 @@ function trendChart(rows) {
     const tip = `<b>${esc(r.bucket)}</b><br>输入 ${fmtNum(r.prompt_tokens)} · 输出 ${fmtNum(r.completion_tokens)}<br>请求 ${fmtNum(r.requests)} · 积分 ${fmtCredit(r.credits)}`;
     const cx = x(i);
     const dots = `
-      <circle cx="${cx}" cy="${y(r.prompt_tokens)}" r="2.5" fill="#3b82f6" pointer-events="none"></circle>
-      <circle cx="${cx}" cy="${y(r.completion_tokens)}" r="2.5" fill="#22c55e" pointer-events="none"></circle>`;
+      <circle class="trend-dot" style="--i:${i}" cx="${cx}" cy="${y(r.prompt_tokens)}" r="2.5" fill="#3b82f6" pointer-events="none"></circle>
+      <circle class="trend-dot" style="--i:${i}" cx="${cx}" cy="${y(r.completion_tokens)}" r="2.5" fill="#22c55e" pointer-events="none"></circle>`;
     return `<g class="chart-hit" onmousemove="showTip(event, ${jsv(tip)})" onmouseleave="hideTip()">
       ${dots}
       <circle cx="${cx}" cy="${H / 2}" r="${Math.max(8, (W - PAD * 2) / Math.max(1, n) / 2)}" fill="transparent"></circle>

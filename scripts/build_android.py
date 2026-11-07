@@ -205,6 +205,11 @@ def prepare() -> None:
     shutil.copytree(ROOT / "admin/static", staging / "admin/static")
     shutil.copytree(ROOT / "admin/console", staging / "admin/console")
     shutil.copytree(ROOT / "admin/data", staging / "admin/data")
+    # 平台自带的数据文件（如 trae/data/catalog_*.json）也要进包：
+    # 上面的 rglob 只拷 *.py，这些 json 在真机/模拟器上一律缺文件，
+    # 运行时只能吃「目录加载失败」告警走网络兜底。
+    for platform_data in (ROOT / "admin/platform").glob("*/data"):
+        shutil.copytree(platform_data, staging / platform_data.relative_to(ROOT))
     app_js = staging / "admin/console/console-app.js"
     app_js.write_text(mobile_js(app_js.read_text(encoding="utf-8")), encoding="utf-8")
     print("Mobile console script rewritten (desktop-only sections removed)")
@@ -246,7 +251,16 @@ def main() -> None:
     if not gradle:
         raise SystemExit("Set --gradle to Gradle 8.11.1 and provide JDK 17 / Android SDK")
     # Keep one private signing identity for all upgrades. Never upload these files.
-    signing = ROOT / "build/android-signing"
+    #
+    # 位置为什么在仓库根、而不是 `build/`：`build_desktop.py` 每次打包都会
+    # `Remove-Item build`，签名身份放在里面等于每发一版就换一把新钥匙 ——
+    # APK 覆盖升级会直接 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，用户只能卸载。
+    # 老位置保留一次性迁移，升级过的人不会因为换了路径又丢一次身份。
+    signing = Path(os.environ.get("WB_ANDROID_SIGNING_DIR") or (ROOT / "android-signing"))
+    legacy_signing = ROOT / "build/android-signing"
+    if not signing.exists() and legacy_signing.is_dir():
+        shutil.copytree(legacy_signing, signing)
+        print(f"Migrated Android signing identity: {legacy_signing} -> {signing}")
     signing.mkdir(parents=True, exist_ok=True)
     credentials = signing / "signing.json"
     keystore = signing / "release.jks"

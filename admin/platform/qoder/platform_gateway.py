@@ -69,14 +69,16 @@ class QoderAccountOps:
         `QUOTA_TTL`（60 秒）内直接用缓存，超出才拉。
         """
         from admin.models import Account
+        from admin.platform import shared as platform_shared
         from admin.platform.shared import (apply_account_filters,
                                            account_order,
                                            summarize_accounts_sql)
 
         def _base_query():
             q = db.query(Account).filter(Account.platform == "qoder")
-            if self.realm:
-                q = q.filter(Account.domain == self.realm)
+            realm_cond = platform_shared.realm_domain_cond(self.realm)
+            if realm_cond is not None:
+                q = q.filter(realm_cond)
             return q
 
         usage_map = {}
@@ -448,6 +450,31 @@ class QoderGateway:
     def account_ops(self) -> AccountOps:
         return QoderAccountOps(self.realm)
 
+    # ---- 凭证有效期 ----
+    def credential_expiry(self, auth_json) -> dict:
+        """Qoder 的 token 到期 + 能否刷新。
+
+        Qoder 的 `jt-` token 有有效期，凭证里带 `refresh_token`；
+        请求路径上会按 `expires - now > 300` 判断并自动刷新。
+        """
+        from admin.platform import shared
+
+        data = shared.parse_auth_json(auth_json)
+        if not data:
+            return shared.credential_window()
+        # 上游 `expiresAt` 国内给毫秒、国际给秒 —— `seconds_from` 两种都兜住
+        expires = shared.seconds_from(
+            data.get("expires_at") or data.get("expiresAt"))
+        has_refresh = bool(data.get("refresh_token") or data.get("refreshToken"))
+        refresh_expires = shared.seconds_from(
+            data.get("refresh_expires_at") or data.get("refreshExpiresAt")) or expires
+        return shared.credential_window(
+            expires_at=expires, refresh_expires_at=refresh_expires or None,
+            has_refresh=has_refresh)
+
+    def renewal_guard_days(self) -> int:
+        return 7
+
     def task_runners(self) -> dict[str, object]:
         # 签到 + 保活：Qoder 的 token 有有效期，定时续期能避免
         # 「账号状态正常但上游 401」这种看着像前端 bug 的情况。
@@ -522,8 +549,10 @@ def _local_ledger(db, realm: str, days: int) -> dict:
     ).filter(UsageLog.platform == "qoder", UsageLog.created_at >= since)
 
     if realm:
+        from admin.platform import shared as platform_shared
         ids = [row[0] for row in db.query(Account.id).filter(
-            Account.platform == "qoder", Account.domain == realm).all()]
+            Account.platform == "qoder",
+            platform_shared.realm_domain_cond(realm)).all()]
         if not ids:
             return {"days": days, "realm": realm, "items": [],
                     "totals": {"requests": 0, "total_tokens": 0}}

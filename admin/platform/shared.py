@@ -25,12 +25,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime
 
 from fastapi import HTTPException
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from admin.models import Account, AccountModelCooldown, ApiKey, ModelConfig, UsageLog
@@ -225,11 +226,361 @@ def key_scope(key: ApiKey | None) -> tuple[int | None, int | None]:
 
 
 # ---------------------------------------------------------------------------
-# 选号
+# 批量执行（签到 / 保活 / 刷余额这类「每个号一次上游调用」的任务）
 # ---------------------------------------------------------------------------
-#: 后台快照刷新的状态：name -> {"running": bool, "at": monotonic}
+#: 定时批处理的并发度。
+#:
+#: 为什么是 8：这些任务 100% 是**网络等待**（每个号 1~3 次上游 HTTP，几百毫秒
+#: 到几秒），串行时 100 个号就是几分钟；并发到 8 能把墙钟时间压到 1/6 左右，
+#: 又不至于把上游风控和本地连接池打满（实测 16 并发时上游开始回 429，
+#: 反而更慢）。可用 `ADMIN_BATCH_CONCURRENCY` 覆盖。
+def batch_concurrency() -> int:
+    import os
+
+    try:
+        value = int(os.getenv("ADMIN_BATCH_CONCURRENCY", "8") or 8)
+    except (TypeError, ValueError):
+        value = 8
+    return max(1, min(32, value))
+
+
+def iter_account_batches(db: Session, *, storage: str, realm: str = "",
+                         status: str = "active", batch: int = 20):
+    """**按主键分批**产出账号 id 列表（不把整个号池读进内存）。
+
+    ## 为什么不能 `query(Account).all()`
+
+    几千个号一次性 `.all()` 意味着：几千个 ORM 对象常驻（每个还带
+    `auth_json` 几百 KB 的整条凭证）、身份映射不清、后续遍历期间任何
+    关系加载都会再触发查询。号池越大越卡，最终表现为「点一下签到，
+    服务先卡住十几秒」。
+
+    这里用**keyset 分页**（`id > last_id ORDER BY id LIMIT n`），
+    主键索引上走，内存里同时在手的只有一批 id。
+    """
+    from admin.models import Account
+
+    last_id = 0
+    while True:
+        query = (db.query(Account.id)
+                 .filter(Account.platform == storage, Account.id > last_id))
+        if status:
+            query = query.filter(Account.status == status)
+        realm_cond = realm_domain_cond(realm)
+        if realm_cond is not None:
+            query = query.filter(realm_cond)
+        rows = query.order_by(Account.id.asc()).limit(max(1, batch)).all()
+        if not rows:
+            return
+        ids = [int(row[0]) for row in rows]
+        last_id = ids[-1]
+        yield ids
+
+
+def run_account_batch(account_ids, worker, *, concurrency: int | None = None,
+                      label: str = "") -> list[dict]:
+    """在**线程池**里并发处理一批账号；每个任务用**自己的 Session**。
+
+    `worker(session, account)` 负责单个账号的全部动作（含提交），返回一个
+    轻量 dict（**不要返回 ORM 对象** —— 那会把对象挂在使用者线程的身份映射上，
+    跨线程用必炸，且拖住整批对象不释放）。
+
+    异常一律收敛成 `{"ok": False, "error": ...}`，绝不让一个坏号打断整批 ——
+    「批量任务跑到一半整个挂掉」是这类后台作业最常见的事故。
+
+    线程数固定为 `concurrency`（默认见 `batch_concurrency()`）：
+    任务本身是 I/O 等待，线程是廉价且最直接的并发手段，不需要 async 改造；
+    SQLAlchemy 的同步 Session 也**不能跨线程共享**，每任务一个才是对的。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from admin.db import SessionLocal
+    from admin.models import Account
+
+    ids = [int(x) for x in (account_ids or []) if x]
+    if not ids:
+        return []
+    workers = max(1, int(concurrency or batch_concurrency()))
+
+    def one(account_id: int) -> dict:
+        session = SessionLocal()
+        try:
+            account = session.get(Account, account_id)
+            if account is None:
+                return {"account_id": account_id, "ok": False,
+                        "error": "账号已不存在"}
+            result = worker(session, account)
+            if isinstance(result, dict):
+                return result
+            return {"account_id": account_id, "ok": True}
+        except Exception as exc:  # noqa: BLE001 - 单个号失败不能拖垮整批
+            logger.debug("%s 处理账号 %s 失败", label or "batch", account_id,
+                         exc_info=True)
+            return {"account_id": account_id, "ok": False,
+                    "error": ("%s: %s" % (type(exc).__name__, exc))[:200]}
+        finally:
+            try:
+                session.rollback()      # 未提交的改动一律丢弃，避免脏写
+            except Exception:  # noqa: BLE001
+                pass
+            session.close()
+
+    # 线程数不得超过任务数：100 个号配 8 线程没问题，2 个号别开 8 个空转
+    workers = min(workers, len(ids))
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix=(label or "batch")) as pool:
+        # `map` 保持输入顺序，结果天然稳定（前端按账号 id 排就好读）
+        return list(pool.map(one, ids))
+
+
+# ---------------------------------------------------------------------------
+# 凭证有效期（各平台共用的「四态」拼装）
+# ---------------------------------------------------------------------------
+#: 有效期告急阈值（天）。超过这个天数就不再提示。
+RENEWAL_WARN_DAYS = 7.0
+
+
+def parse_auth_json(auth_json) -> dict:
+    """`auth_json`（字符串或已解析的 dict）→ dict，坏数据给空字典。"""
+    if isinstance(auth_json, dict):
+        return auth_json
+    try:
+        data = json.loads(auth_json or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def credential_window(*, expires_at=None, refresh_expires_at=None,
+                      has_refresh: bool = False,
+                      warn_days: float = RENEWAL_WARN_DAYS,
+                      now: float | None = None) -> dict:
+    """把「到期时间 + 有没有 refresh」摊成 **admin 侧统一消费的四态结构**。
+
+    为什么要这个函数：`admin/credential_expiry.py` 只认识这一份形状。
+    平台各自实现时最容易写歪的两处是「单位」（毫秒当秒）和「状态判定」
+    （过期了还说 ok）—— 统一在这里算，平台只负责从凭证里把 `expires_at`
+    取出来。
+
+    所有时间参数都是 **epoch 秒**（毫秒请先 `seconds_from()` 或自己除 1000）。
+    """
+    now = now if now is not None else time.time()
+
+    def _state(ts):
+        if not ts:
+            return "unknown", None
+        days = round((float(ts) - now) / 86400.0, 1)
+        if days <= 0:
+            return "expired", days
+        return ("expiring" if days <= warn_days else "ok"), days
+
+    state, days_left = _state(expires_at)
+    refresh_state, refresh_days_left = _state(refresh_expires_at)
+    # 「还救不救得回来」：有 refresh 且续期窗口没过
+    renewable = bool(has_refresh) and refresh_state != "expired"
+    return {
+        "supported": True,
+        "expires_at": int(expires_at) if expires_at else None,
+        "days_left": days_left,
+        "state": state,
+        "refresh_expires_at": int(refresh_expires_at) if refresh_expires_at else None,
+        "refresh_days_left": refresh_days_left,
+        "refresh_state": refresh_state,
+        "renewal_known": bool(expires_at or refresh_expires_at),
+        "renewable": renewable,
+        "has_refresh": bool(has_refresh),
+    }
+
+
+def seconds_from(value) -> float:
+    """把上游给的到期时间归一成 **epoch 秒**。
+
+    上游单位极不统一（毫秒 / 秒 / 数字串 / ISO 串都见过）：
+      * 数字 > 1e11 视为毫秒
+      * 数字串走同一规则
+      * 其它按 ISO8601 解析
+    取不到一律返回 0 —— **不要**猜默认值，猜错会让「已过期」显示成「还早」。
+    """
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number / 1000.0 if number > 1e11 else number
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    if text.replace(".", "", 1).isdigit():
+        try:
+            return seconds_from(float(text))
+        except ValueError:
+            return 0.0
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
 _SNAPSHOT_REFRESH: dict[str, dict] = {}
 _SNAPSHOT_REFRESH_LOCK = threading.Lock()
+
+
+def import_refresh_concurrency() -> int:
+    """导入后自动刷余额的并发数（环境变量 `ADMIN_IMPORT_REFRESH_CONCURRENCY`）。
+
+    单账号刷新 = 1~2 次上游往返（实测 WorkBuddy ~1.2s/号），12 并发
+    可以把 100 个号的导入补刷压到 ~15 秒内。可调上限钳到 24：再高
+    上游会开始返回限流，反而拖慢整体。
+    """
+    raw = os.environ.get("ADMIN_IMPORT_REFRESH_CONCURRENCY", "").strip()
+    try:
+        value = int(raw) if raw else 12
+    except ValueError:
+        value = 12
+    return max(1, min(value, 24))
+
+
+#: 正在排队补刷的账号 id —— 同一个号一次导入只排一队，避免重复打上游
+_IMPORT_REFRESH_QUEUED: set[int] = set()
+_IMPORT_REFRESH_LOCK = threading.Lock()
+#: 合批窗口：逐条 import_record 的批量导入在窗口内合并成一个后台批次，
+#: 否则 500 条 = 500 个线程 × 线程池，纯浪费
+_IMPORT_REFRESH_PENDING: dict[str, list[int]] = {}
+_IMPORT_REFRESH_COALESCE_SEC = 0.75
+
+
+def _spawn_import_refresh(platform_id: str, fresh: list[int]) -> None:
+    """真正的后台批次（独立线程 + 线程池 + 独立 Session）。"""
+
+    def _refresh_one(session, account_id: int) -> None:
+        from admin.platform import registry as _registry
+
+        spec = _registry.get(platform_id)
+        if spec is None:
+            raise RuntimeError("平台未注册：%s" % platform_id)
+        gateway = _registry.load_platform_gateway(spec, spec.realm)
+        if gateway is None:
+            raise RuntimeError("平台未实现管理契约：%s" % platform_id)
+        # 标准入口是 AccountOps.refresh（各平台余额口径不同，契约 §AccountOps）；
+        # 个别平台把 refresh 直接挂在 gateway 上 —— 两种都认。
+        ops = (gateway.account_ops()
+               if hasattr(gateway, "account_ops") else None)
+        if ops is not None and hasattr(ops, "refresh"):
+            ops.refresh(session, account_id, force=True)
+        elif hasattr(gateway, "refresh"):
+            gateway.refresh(session, account_id, force=True)
+        else:
+            raise RuntimeError("平台未实现 refresh：%s" % platform_id)
+
+    def _run() -> None:
+        from admin.db import SessionLocal
+
+        try:
+            workers = min(import_refresh_concurrency(), len(fresh))
+            from concurrent.futures import ThreadPoolExecutor
+
+            def one(account_id: int) -> None:
+                for attempt in (1, 2):
+                    try:
+                        with SessionLocal() as session:
+                            _refresh_one(session, account_id)
+                            session.commit()
+                        break
+                    except Exception:  # noqa: BLE001 - 单号失败不拖垮整批
+                        if attempt == 2:
+                            logger.warning("导入后余额刷新失败 平台=%s 账号=%s",
+                                           platform_id, account_id, exc_info=True)
+                        else:
+                            time.sleep(2.0)
+                    finally:
+                        with _IMPORT_REFRESH_LOCK:
+                            _IMPORT_REFRESH_QUEUED.discard(account_id)
+
+            with ThreadPoolExecutor(max_workers=workers,
+                                    thread_name_prefix="import-refresh") as pool:
+                list(pool.map(one, fresh))
+        except Exception:  # noqa: BLE001 - 后台任务绝不冒泡
+            logger.exception("导入后余额刷新异常（不影响已入库账号）")
+            with _IMPORT_REFRESH_LOCK:
+                _IMPORT_REFRESH_QUEUED.difference_update(fresh)
+
+    threading.Thread(target=_run, name="import-refresh-%s" % platform_id,
+                     daemon=True).start()
+
+
+def schedule_import_refresh(platform_id: str, account_ids, *,
+                            with_retry: bool = True) -> int:
+    """账号入库落库之后，把余额刷新丢到后台线程，HTTP 立即返回。
+
+    ## 为什么需要它
+
+    「扫描本机 / 导入文件」落库时只写凭证，余额列是列默认值 0 —— 各平台
+    只有 WorkBuddy 自己实现了导入后补刷（`accounts.py:_refresh_pending_async`），
+    Trae / 小浣熊等平台的导入是「纯落库」，用户进面板看到的就是 0，还得
+    手动点一次「刷新余额」。这里提供一个**框架层**的通用补刷：平台自己
+    不用再写线程池，挂一行调用即可。
+
+    ## 刷新走谁
+
+    调**该平台自己**的 `platform_gateway.refresh(db, account_id, force=True)`
+    （Gateway 契约 §AccountOps）——各平台的余额口径不同（Trae 是美元额度、
+    小浣熊是积分、MiniMax 是签到积分），框架层不认识任何一家的接口，
+    只负责调度。平台没实现管理契约时安静返回 0（不报错）。
+
+    约束：
+      * **独立 Session**：SQLAlchemy Session 不能跨线程共享；
+      * **去重**：同一个号已在补刷队列时不重复排队；
+      * **合批**：`_IMPORT_REFRESH_COALESCE_SEC` 窗口内同平台的多次调用
+        合并成一个后台批次（批量导入是逐条 `import_record` 的）；
+      * **重试**：单号失败重试 1 次（导入的凭证刚落库，第一次可能撞上
+        上游冷启动）；重试仍失败只记日志，绝不冒泡；
+      * **并发可配**：`ADMIN_IMPORT_REFRESH_CONCURRENCY`（默认 12）。
+
+    返回实际排入补刷的账号数。`with_retry=False` 预留给调用方自带重试的
+    场景（当前内部批次恒定重试，参数仅为签名兼容保留）。
+    """
+    del with_retry  # 见 docstring：批次内恒定重试一次
+    ids = []
+    for value in (account_ids or []):
+        try:
+            ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return 0
+
+    flush_at = time.monotonic() + _IMPORT_REFRESH_COALESCE_SEC
+    del flush_at
+    with _IMPORT_REFRESH_LOCK:
+        fresh = [i for i in ids if i not in _IMPORT_REFRESH_QUEUED]
+        _IMPORT_REFRESH_QUEUED.update(fresh)
+        if fresh:
+            _IMPORT_REFRESH_PENDING.setdefault(platform_id, []).extend(fresh)
+            scheduled = len(_IMPORT_REFRESH_PENDING[platform_id])
+        else:
+            scheduled = 0
+    if not fresh:
+        return 0
+
+    def _flush() -> None:
+        with _IMPORT_REFRESH_LOCK:
+            batch = _IMPORT_REFRESH_PENDING.pop(platform_id, [])
+        if batch:
+            _spawn_import_refresh(platform_id, batch)
+
+    if scheduled == len(fresh):
+        # 本平台当前没有待触发的批次 —— 由这次调用在窗口结束后触发；
+        # 已有排队中的批次则等它一起带走（合批）。
+        def _timer() -> None:
+            time.sleep(_IMPORT_REFRESH_COALESCE_SEC)
+            _flush()
+
+        threading.Thread(target=_timer, daemon=True,
+                         name="import-refresh-timer-%s" % platform_id).start()
+    return len(fresh)
 
 
 def kick_background_refresh(name: str, account_ids, worker, *,
@@ -294,6 +645,30 @@ def kick_background_refresh(name: str, account_ids, worker, *,
     return True
 
 
+def realm_domain_cond(realm: str):
+    """按区过滤账号的 where 条件（**空 domain 通配**），无区时返回 None。
+
+    ## 为什么必须通配空 domain
+
+    分区功能上线前导入的账号 `domain` 是空串 —— 严格相等过滤
+    （`Account.domain == realm`）会让它们在**所有按区读取里隐身**：
+    平台卡计数 0、`select_account` 选不到号（503「没有可用账号」）、
+    调度器批量刷新跳过；而账号池页不按 domain 过滤，两边对不上。
+    2026-11-07 实测误报：Qoder 国际版页面上有号，网关却 503。
+
+    语义：空 domain = 「区域未知」。它在**任何一个区都可用**
+    （发错区会被上游 403 → 冷却换号，与无分区平台的既有行为一致）；
+    显式标了**其它区**的号仍然互不串，不会把国内流量发给国际号。
+    新导入的账号都会写 domain，通配集合只减不增。
+    """
+    if not realm:
+        return None
+    from admin.models import Account
+
+    return or_(Account.domain == realm,
+               func.coalesce(Account.domain, "") == "")
+
+
 def select_account(db: Session, *, storage: str, realm: str = "",
                    key: ApiKey | None = None, model: str = "",
                    exclude_ids=None, now: datetime | None = None,
@@ -332,8 +707,9 @@ def select_account(db: Session, *, storage: str, realm: str = "",
     query = (db.query(Account).populate_existing()
              .filter(Account.platform == storage, Account.status == "active"))
     query = scope_accounts(query, account_id, key_id, key=key)
-    if realm:
-        query = query.filter(Account.domain == realm)
+    realm_cond = realm_domain_cond(realm)
+    if realm_cond is not None:
+        query = query.filter(realm_cond)
     if exclude_ids:
         query = query.filter(~Account.id.in_(exclude_ids))
     if min_balance is not None:
@@ -417,8 +793,20 @@ def note_success(account: Account | None) -> None:
 
 def note_failure(db: Session, account: Account | None, *, kind: str,
                  detail: str = "", status: int = 0, model: str = "",
-                 public_platform: str = "", cool_seconds: int = 0) -> None:
-    """把失败写回账号，并按需要进哨兵。**不抛异常**。"""
+                 public_platform: str = "", cool_seconds: int = 0,
+                 zero_balance: bool = False) -> None:
+    """把失败写回账号，并按需要进哨兵。**不抛异常**。
+
+    ## `zero_balance`：额度类失败要**落一个 0 到余额列**
+
+    只冷却（`cool_seconds`）是不够的：冷却到期后这个号会重新排进候选，
+    于是每 10 分钟又白撞一次 402 —— 用户看到的就是「又切到那个额度已用尽的号」。
+
+    `balance_remain > 0 OR IS NULL` 才是选号条件（见 `select_account` 的
+    `min_balance`），所以**把余额写成 0 就等于把它从候选里摘掉**，而且不会
+    影响凭证（号还是 active）。等下一次余额同步 / 每日签到刷新出真实额度，
+    `apply_quota` 会把这一列覆盖回正数，号自动回到池子里 —— 不需要人工解禁。
+    """
     if account is None:
         return
     try:
@@ -426,6 +814,10 @@ def note_failure(db: Session, account: Account | None, *, kind: str,
         account.last_err_at = now
         account.last_err_msg = (detail or kind or "")[:255]
         account.err_count = int(account.err_count or 0) + 1
+        if zero_balance:
+            # 只降不升：已经记 0 的保持 0，不要把它改回未知（NULL）——
+            # NULL 会被选号当成「余额未知，放行」，等于又把空号放回队列。
+            account.balance_remain = 0
         if cool_seconds > 0:
             until = now + __import__("datetime").timedelta(seconds=cool_seconds)
             if account.cool_until is None or account.cool_until < until:
