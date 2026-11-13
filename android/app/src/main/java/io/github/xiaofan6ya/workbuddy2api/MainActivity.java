@@ -2,6 +2,7 @@ package io.github.xiaofan6ya.workbuddy2api;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.*;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
@@ -55,6 +56,10 @@ public class MainActivity extends Activity {
     private byte[] exportBytes;
     private volatile boolean exportWriting;
     private byte[] startupExport;
+    /** 最近一次导出成功的目标 Uri —— 「打开文件位置」用它。 */
+    private Uri lastExportUri;
+    /** 最近一次导出的人类可读位置（`内部存储/Download/xxx.json`）。 */
+    private String lastExportLocation = "";
     private final Runnable waitForServer = new Runnable() {
         @Override public void run() {
             if (destroyed) return;
@@ -417,6 +422,9 @@ public class MainActivity extends Activity {
                 data.put("background_restricted", Build.VERSION.SDK_INT >= 28 && activity.isBackgroundRestricted());
                 data.put("power_save", power.isPowerSaveMode());
                 data.put("wake_lock", LocalApiService.wakeLockHeld());
+                data.put("keeper_enabled", ServiceKeeper.enabled(MainActivity.this));
+                data.put("interrupts", ServiceKeeper.interrupts(MainActivity.this));
+                data.put("last_interrupt", ServiceKeeper.lastInterrupt(MainActivity.this));
                 data.put("origin", LocalApiService.origin);
                 data.put("error", LocalApiService.error);
             } catch (Exception ignored) { }
@@ -424,6 +432,14 @@ public class MainActivity extends Activity {
         }
         @JavascriptInterface public void restartService() {
             if (bridgeTrusted) handler.post(() -> { if (!destroyed) startLocalService(true); });
+        }
+        /** 打开最近一次导出的文件（「打开文件位置」按钮的 JS 入口）。 */
+        @JavascriptInterface public void revealLastExport() {
+            if (bridgeTrusted) handler.post(() -> { if (!destroyed) openLastExport(); });
+        }
+        /** 最近一次导出的可读位置；没导出过返回空串。 */
+        @JavascriptInterface public String lastExportPath() {
+            return bridgeTrusted ? lastExportLocation : "";
         }
         @JavascriptInterface public void openSystemSettings(String section) {
             if (!bridgeTrusted) return;
@@ -441,6 +457,8 @@ public class MainActivity extends Activity {
                         intent = new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                                             Uri.parse("package:" + getPackageName()));
                     }
+                } else if ("startup".equals(section) && selfStartIntent() != null) {
+                    intent = selfStartIntent();
                 } else {
                     intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                                         Uri.parse("package:" + getPackageName()));
@@ -456,6 +474,33 @@ public class MainActivity extends Activity {
     }
 
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
+
+    /**
+     * 国产 ROM 的「自启动 / 关联启动」管理页。
+     *
+     * 这些页面不在公开 SDK 里，只能按类名猜；猜不中就返回 null，
+     * 调用方退回应用详情页 —— 用户至少还能手动摸过去。
+     * 顺序按机型常见度排，ColorOS 放最前（issue #37 的复现机是 OPPO）。
+     */
+    private Intent selfStartIntent() {
+        String[][] routes = new String[][]{
+            {"com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity"},
+            {"com.coloros.safecenter", "com.coloros.safecenter.startupapp.StartupAppListActivity"},
+            {"com.oplus.safecenter", "com.oplus.safecenter.startupapp.StartupAppListActivity"},
+            {"com.oplus.battery", "com.oplus.powermanager.fuelgaue.PowerUsageModelActivity"},
+            {"com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"},
+            {"com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"},
+            {"com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"},
+            {"com.samsung.android.lool", "com.samsung.android.sm.ui.battery.BatteryActivity"},
+        };
+        for (String[] route : routes) {
+            try {
+                Intent intent = new Intent().setClassName(route[0], route[1]);
+                if (getPackageManager().resolveActivity(intent, 0) != null) return intent;
+            } catch (Exception ignored) { }
+        }
+        return null;
+    }
 
     private boolean isAdmin(String url) {
         if (loadedOrigin == null || url == null) return false;
@@ -474,8 +519,11 @@ public class MainActivity extends Activity {
     }
     @Override protected void onResume() {
         super.onResume();
-        // Re-register the foreground service even when Python left an old origin in memory.
-        if (web != null) startLocalService();
+        // 只在「服务确实不在了」时补一次启动。
+        // 每次 onResume 都无条件 startForegroundService，会和看门狗抢着重建服务，
+        // 通知跟着闪一下 —— 这就是 issue #37 里「一回到前台就重启服务」的观感来源。
+        if (web != null && (!LocalApiService.registered
+                || (LocalApiService.origin == null && !LocalApiService.starting))) startLocalService();
         if (web != null) web.evaluateJavascript("window.dispatchEvent(new Event('wb-shell-resume'))", null);
         if (LocalApiService.origin != null && Python.isStarted()) new Thread(() -> {
             try {
@@ -522,6 +570,7 @@ public class MainActivity extends Activity {
             }
             final Uri target = data.getData();
             final byte[] content = exportBytes;
+            final String location = describeDocument(target);
             exportWriting = true;
             new Thread(() -> {
                 boolean success = false;
@@ -535,8 +584,103 @@ public class MainActivity extends Activity {
                     android.util.Log.e("WorkBuddyExport", "Document write failed: " + e.getClass().getSimpleName());
                 }
                 final boolean saved = success;
-                handler.post(() -> finishExport(saved, saved ? "文件已保存" : "文件写入失败，请更换保存位置"));
+                handler.post(() -> {
+                    if (saved) {
+                        lastExportUri = target;
+                        lastExportLocation = location;
+                    }
+                    finishExport(saved, saved
+                        ? "已保存到 " + location
+                        : "文件写入失败，请更换保存位置");
+                    if (saved) showExportDoneDialog(location);
+                });
             }, "workbuddy-file-export").start();
+        }
+    }
+
+    /**
+     * 把 SAF 的 content Uri 翻译成人能看懂的位置。
+     *
+     * `ACTION_CREATE_DOCUMENT` 返回的是 document provider 的 Uri
+     * （`content://com.android.externalstorage.documents/document/primary%3ADownload%2Fa.json`），
+     * 直接展示这串东西等于没说 —— 用户要的是「我能在哪找到它」。
+     */
+    private String describeDocument(Uri uri) {
+        String authority = uri == null ? "" : String.valueOf(uri.getAuthority());
+        String docId = "";
+        try { docId = android.provider.DocumentsContract.getDocumentId(uri); }
+        catch (Exception ignored) { }
+        String name = queryDisplayName(uri);
+        if (docId == null) docId = "";
+        if (docId.startsWith("primary:")) {
+            return "内部存储/" + docId.substring("primary:".length());
+        }
+        if (docId.startsWith("home:")) {
+            return "文档/" + docId.substring("home:".length());
+        }
+        if (docId.contains(":") && !authority.contains("downloads")) {
+            // 形如 `1A2B-3C4D:Download/a.json` —— 可移动存储
+            int split = docId.indexOf(':');
+            return "存储卡(" + docId.substring(0, split) + ")/" + docId.substring(split + 1);
+        }
+        if (authority.contains("downloads")) {
+            return "下载/" + (name.isEmpty() ? docId : name);
+        }
+        if (!name.isEmpty()) return name;
+        return docId.isEmpty() ? String.valueOf(uri) : docId;
+    }
+
+    private String queryDisplayName(Uri uri) {
+        if (uri == null) return "";
+        try (android.database.Cursor cursor = getContentResolver().query(
+                uri, new String[]{android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                String value = cursor.getString(0);
+                return value == null ? "" : value;
+            }
+        } catch (Exception ignored) { }
+        return "";
+    }
+
+    /** 导出完成弹窗：明确写清保存位置，并给「打开文件位置」。 */
+    private void showExportDoneDialog(String location) {
+        if (destroyed || isFinishing()) return;
+        try {
+            new AlertDialog.Builder(this)
+                .setTitle("导出完成")
+                .setMessage("文件已保存到：\n" + location
+                    + "\n\n点「打开文件位置」可以直接跳到该文件。")
+                .setPositiveButton("打开文件位置", (dialog, which) -> openLastExport())
+                .setNegativeButton("关闭", null)
+                .show();
+        } catch (Exception ignored) { }
+    }
+
+    /**
+     * 打开最近一次导出的文件。
+     *
+     * 用 `ACTION_VIEW` 而不是去猜一个目录路径：Android 10+ 的分区存储里
+     * 应用拿不到「打开 Downloads 目录」的通用 Intent，但**打开这个文件本身**
+     * 一定能落到系统文件管理器 / 对应查看器，用户从那里能返回所在目录。
+     */
+    private void openLastExport() {
+        Uri uri = lastExportUri;
+        if (uri == null) {
+            Toast.makeText(this, "还没有导出过文件", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            Intent view = new Intent(Intent.ACTION_VIEW)
+                .setDataAndType(uri, "application/octet-stream")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                          | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(Intent.createChooser(view, "打开导出文件"));
+        } catch (Exception e) {
+            // 没有能打开它的查看器：退回文件管理器首页并把路径念出来。
+            Toast.makeText(this, lastExportLocation, Toast.LENGTH_LONG).show();
+            try {
+                startActivity(new Intent(android.provider.Settings.ACTION_INTERNAL_STORAGE_SETTINGS));
+            } catch (Exception ignored) { }
         }
     }
     private void finishExport(boolean success, String message) {

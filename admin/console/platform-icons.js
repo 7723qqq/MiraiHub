@@ -74,6 +74,10 @@
     // MiniMax：素材取自客户端 asar `out/assets/logo/agentLogo.png`
     // （128×128 RGBA 蓝渐变章鱼）放大到 256。自带底色，tone=color。
     minimax: { src: "/admin/assets/logos/minimax-256.png", tone: "color" },
+    // WPS 灵犀：素材取自客户端 web 端 manifest 的官方图标
+    // `qn.cache.wpscdn.cn/copilot-test/copilot-cdn/images/copilot/lingxi_logo_512_v1.png`
+    // （512×512 RGBA）缩放到 256。自带渐变底，深浅主题都能直接用，tone=color。
+    wps: { src: "/admin/assets/logos/wps-lingxi-256.png", tone: "color" },
   };
 
   /* 兜底：不要用「加号」（看着像「新建平台」）。 */
@@ -109,6 +113,10 @@
     minimax: "minimax",
     "minimax-cn": "minimax",
     "minimax-en": "minimax",
+    // WPS 灵犀：落库平台名是 wps_lingxi，对外 id 是 wps-lingxi（两种都认）
+    "wps-lingxi": "wps",
+    wps_lingxi: "wps",
+    wps: "wps",
   };
 
   function resolve(id) {

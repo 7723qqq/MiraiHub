@@ -107,6 +107,40 @@ def select(db: Session, realm: str = "", mark_picked: bool = False) -> Account |
     return None
 
 
+def export_record(account: Account, *, reveal: bool = False) -> dict:
+    """单个号 → 可导出记录（与 `import_record` 对称）。
+
+    `reveal=True` 时带上 `token`（完整登录态），导出的 JSONL 能直接喂回
+    `/api/loomy/import-batch` 完成「换机器搬号池」。
+    `reveal=False` 只给台账字段：uid / 手机号打码 / 余额 / 到期时间，
+    不含任何可用于登录的东西 —— 这种文件发给别人也不会泄号。
+    """
+    data = credentials_of(account)
+    token = token_of(data)
+    record: dict = {
+        "platform": PLATFORM,
+        "realm": realm_of(account),
+        "uid": str(account.uid or data.get("uid") or ""),
+        "status": getattr(account, "status", "") or "",
+        "balance_remain": int(getattr(account, "balance_remain", 0) or 0),
+        "balance_total": int(getattr(account, "balance_total", 0) or 0),
+        "session_expires_at": session_expires_at(data) or None,
+    }
+    phone = str(data.get("phone") or "")
+    if phone:
+        record["phone"] = phone if reveal else (
+            phone[:3] + "****" + phone[-4:] if len(phone) >= 7 else "***")
+    if reveal:
+        if not token:
+            return {}
+        record["token"] = token
+        if data.get("password"):
+            record["password"] = data["password"]
+        if data.get("loginid"):
+            record["loginid"] = data["loginid"]
+    return record
+
+
 def apply_quota(account: Account, quota: dict) -> None:
     """写回统一列。
 
@@ -136,12 +170,22 @@ def apply_quota(account: Account, quota: dict) -> None:
     account.credits_synced_at = datetime.utcnow()
     account.last_sync_at = datetime.utcnow()
     try:
-        previous_models = int((json.loads(account.credits_snapshot or "{}")
-                               or {}).get("models") or 0)
+        previous_snapshot = json.loads(account.credits_snapshot or "{}") or {}
     except (ValueError, TypeError, AttributeError):
+        previous_snapshot = {}
+    if not isinstance(previous_snapshot, dict):
+        previous_snapshot = {}
+    try:
+        previous_models = int(previous_snapshot.get("models") or 0)
+    except (TypeError, ValueError):
         previous_models = 0
     fetched_models = quota.get("models")
-    account.credits_snapshot = json.dumps({
+    # ⚠️ **合并**而不是整段重写：`credits_snapshot` 里还存着别的东西
+    # （邀请码状态 `invite` 就是由 `services/invite.py` 写在这里的）。
+    # 原来这里 `json.dumps({...})` 一把覆盖 —— 每次刷余额都会把邀请状态抹掉，
+    # 表现就是「同步完邀请状态，点一下刷新额度又全变未同步」。
+    snapshot = dict(previous_snapshot)
+    snapshot.update({
         "unit": "points",
         "quota_kind": "balance",
         "balance": int(quota.get("balance") or 0),
@@ -149,7 +193,8 @@ def apply_quota(account: Account, quota: dict) -> None:
         "available": available,
         "models": int(fetched_models) if fetched_models is not None
                   else previous_models,
-    }, ensure_ascii=False)[:20000]
+    })
+    account.credits_snapshot = json.dumps(snapshot, ensure_ascii=False)[:20000]
 
 
 def sync_quota(db: Session, account: Account, *,
@@ -195,6 +240,69 @@ def sync_quota(db: Session, account: Account, *,
         account.cool_kind = "quota"
     db.commit()
     return {"ok": True, "quota": quota}
+
+
+#: 「余额被误清零」的自愈重同步最小间隔（秒）。
+#: 一次请求最多修几个号，避免把一次 402 放大成 50 次积分接口调用。
+HEAL_MIN_INTERVAL = 30.0
+HEAL_MAX_ACCOUNTS = 8
+_heal_lock: dict[str, float] = {}
+
+
+def heal_stale_zero(db: Session, realm: str = "",
+                    limit: int = HEAL_MAX_ACCOUNTS) -> dict:
+    """把「余额是 0 但上游确实发过配额」的号重新同步一次。
+
+    ## 为什么需要它（2026-11-09 实测）
+
+    `shared.note_failure(zero_balance=True)` 历史上只要碰到一次 402 就把
+    `balance_remain` 写成 0。于是号池里出现大量
+    `balance_remain = 0` 而 `balance_total = 4800` 的号 —— 它们**其实有额度**，
+    只是被那一次失败永久摘出了候选集。等所有号都被这么摘掉之后，
+    请求就统一回「所有 Loomy 账号的积分都已用尽」，
+    而用户在控制台看到的是「号池这么多账号，怎么可能都没额度」。
+
+    这里按 `balance_total > 0 and balance_remain <= 0` 挑出这类号，
+    重新拉一次 `/points/balance`（`apply_quota` 会把真实数字写回来），
+    号自动回池。带最小间隔与数量上限，热路径上不会变成风暴。
+    """
+    now = time.time()
+    stamp_key = "global"
+    last = _heal_lock.get(stamp_key) or 0.0
+    if now - last < HEAL_MIN_INTERVAL:
+        return {"ok": True, "skipped": True, "healed": 0, "attempted": 0}
+    query = db.query(Account).filter(
+        Account.platform == PLATFORM,
+        Account.status == "active",
+        Account.balance_total > 0,
+        Account.balance_remain <= 0)
+    if realm:
+        query = query.filter(Account.domain == realm)
+    # 从没同步过的优先：`IS NULL` 排在前面（用布尔表达式，不用
+    # `NULLS FIRST` —— MySQL 不认那个语法，SQLAlchemy 会原样发出去）。
+    rows = query.order_by(Account.last_sync_at.is_(None).desc(),
+                          Account.last_sync_at.asc()).limit(
+        max(1, int(limit))).all()
+    if not rows:
+        return {"ok": True, "skipped": False, "healed": 0, "attempted": 0}
+    _heal_lock[stamp_key] = now
+    healed, failed = 0, 0
+    for account in rows:
+        try:
+            result = sync_quota(db, account, with_models=False)
+        except Exception:  # noqa: BLE001 - 单个号失败不影响其余
+            db.rollback()
+            failed += 1
+            continue
+        if result.get("ok") and int(account.balance_remain or 0) > 0:
+            healed += 1
+        else:
+            failed += 1
+    if healed:
+        logger.info("Loomy 余额自愈：%d 个被误清零的号已恢复（%d 个仍然无额度）",
+                    healed, failed)
+    return {"ok": True, "skipped": False, "healed": healed,
+            "attempted": len(rows), "failed": failed}
 
 
 #: 上游 session 的有效期。**客户端登录时传的就是这个值**
@@ -359,6 +467,30 @@ def _expiring_soon(data: dict | None) -> bool:
     return days is not None and days <= SESSION_WARN_DAYS
 
 
+def _invite_state(account: Account) -> dict:
+    """邀请码状态的**本地快照**（列表渲染用，不发上游请求）。
+
+    数据由 `services/invite.py` 写入 `credits_snapshot['invite']`：
+    同步任务、绑定动作、兑换动作都会更新它。列表一次可能拉几百个号，
+    逐号打 `GET /points/activation` 是不现实的。
+    """
+    try:
+        snap = json.loads(account.credits_snapshot or "{}")
+    except (ValueError, TypeError):
+        return {"activated": False, "code": "", "known": False}
+    state = (snap or {}).get("invite") if isinstance(snap, dict) else None
+    if not isinstance(state, dict):
+        return {"activated": False, "code": "", "known": False}
+    return {
+        "activated": bool(state.get("activated")),
+        "code": str(state.get("code") or ""),
+        "note": str(state.get("note") or ""),
+        "at": int(state.get("at") or 0),
+        # known=False 表示还没同步过 —— 前端据此显示「未同步」而不是「未激活」
+        "known": True,
+    }
+
+
 def public_view(account: Account, *, quota: dict | None = None) -> dict:
     """给前端的视图（**不含 token**）。
 
@@ -378,6 +510,9 @@ def public_view(account: Account, *, quota: dict | None = None) -> dict:
         models = snapshot.get("models")
     return {
         "id": account.id,
+        # 前端按账号归属平台选接口（刷新/删除/禁用），少了这个字段就会
+        # 一律退回 WorkBuddy 的 `/api/accounts/*`，报「账号凭证缺少 auth」。
+        "platform": PLATFORM,
         "name": account.name,
         "uid": account.uid,
         "realm": realm_of(account),
@@ -390,6 +525,11 @@ def public_view(account: Account, *, quota: dict | None = None) -> dict:
         "models": int(models or 0),
         "phone": str(data.get("phone") or ""),
         "has_refresh": False,
+        # ---- 邀请码状态（读本地快照，**不发上游请求**）----
+        # 用户要求「账号池里把账号的邀请状态显示出来」。上游要逐号查，
+        # 列表一次拉 85 个号不可能打 85 次请求，所以由
+        # `invite.sync_all()` / 绑定/兑换时写进 credits_snapshot，这里只读。
+        "invite": _invite_state(account),
         # 能不能自动续期：只有存了手机号+密码才可以（服务端无 refresh 接口）
         "renewable": has_password(data),
         "renew_before_days": SESSION_RENEW_BEFORE_DAYS,
@@ -504,15 +644,33 @@ def import_record(db: Session, record: dict) -> dict:
     existing.name = clean_display_name(str(record.get("name") or existing.name or uid or "Loomy"))
     existing.uid = uid or existing.uid
     existing.domain = realm
-    existing.auth_json = json.dumps({
+    # ⚠️ **旧的 auth_json 必须合并，不能整段重写**。
+    #
+    # 这里原来只写 realm/token/uid/phone/updatedAt/expires_at，把
+    # `devid` / `loginid` / `password` 全丢了 —— 而这三样正是「到期自动续期」
+    # 依赖的全部信息：
+    #   · 没有 loginid+password → `renew_with_password()` 直接判不可续，
+    #     14 天后 session 报废就只能人工再收一次短信；
+    #   · 没有 devid → 续期会用默认 `web` 重新登录，上游看到「同一账号换设备」。
+    # 于是在控制台走一次「手机号登录/注册」看起来成功，实际续期链是断的。
+    previous = credentials_of(existing)
+    payload = dict(previous)
+    payload.update({
         "realm": realm,
         "token": token,
         "uid": uid,
-        "phone": str(record.get("phone") or ""),
+        "phone": str(record.get("phone") or previous.get("phone") or ""),
         # 保留客户端写入时间 + 推算出的死线（见 session_expires_at）
-        "updatedAt": record.get("updatedAt"),
-        "expires_at": int(session_expires_at(record) or 0),
-    }, ensure_ascii=False)
+        "updatedAt": record.get("updatedAt") or previous.get("updatedAt"),
+        "expires_at": int(session_expires_at({**previous, **record}) or 0),
+    })
+    for key in ("devid", "loginid", "password"):
+        value = str(record.get(key) or "").strip()
+        if value:
+            payload[key] = value
+        elif key in previous:
+            payload[key] = previous[key]
+    existing.auth_json = json.dumps(payload, ensure_ascii=False)
     # 导入的 token 一律标「未验证」：probe 会把它刷成 active/disabled。
     existing.status = "active"
     existing.session_dead_fails = 0

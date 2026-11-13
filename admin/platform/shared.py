@@ -451,6 +451,18 @@ _IMPORT_REFRESH_LOCK = threading.Lock()
 _IMPORT_REFRESH_PENDING: dict[str, list[int]] = {}
 _IMPORT_REFRESH_COALESCE_SEC = 0.75
 
+#: 额度类失败（402）在「上游确实发过配额」的号上，用**降级窗口**隔离多久。
+#:
+#: 为什么不直接清零余额：一次瞬时 402 就把 `balance_remain` 写成 0，
+#: 会让这个号永久退出候选集（`balance_total` 却还是 4800）——
+#: 攒够几十个之后整个平台就只剩「所有账号额度已用尽」。
+#: 降级窗口是可恢复的隔离：窗口内不选它，到期后给一次机会，
+#: 期间任何一次余额同步都会把真实数字写回来。
+#:
+#: 30 分钟：比 600 秒的普通冷却长得多（能挡住「每 10 分钟白撞一次 402」），
+#: 又不至于让一个只是被限流的号停摆一整天。
+QUOTA_DEGRADE_SECONDS = 1800
+
 
 def _spawn_import_refresh(platform_id: str, fresh: list[int]) -> None:
     """真正的后台批次（独立线程 + 线程池 + 独立 Session）。"""
@@ -780,6 +792,19 @@ def release(account: Account | None) -> None:
         pass
 
 
+def exclude_identity(db: Session, exclude_ids: set[int], account: Account | None) -> None:
+    """排除当前上游身份的全部重复数据库记录，避免换号仍命中同一 UID。"""
+    if account is None:
+        return
+    if account.id:
+        exclude_ids.add(int(account.id))
+    uid = str(getattr(account, "uid", "") or "")
+    if not uid:
+        return
+    rows = db.query(Account.id).filter(Account.uid == uid).all()
+    exclude_ids.update(int(row[0]) for row in rows if row[0])
+
+
 def note_success(account: Account | None) -> None:
     if account is None:
         return
@@ -794,7 +819,8 @@ def note_success(account: Account | None) -> None:
 def note_failure(db: Session, account: Account | None, *, kind: str,
                  detail: str = "", status: int = 0, model: str = "",
                  public_platform: str = "", cool_seconds: int = 0,
-                 zero_balance: bool = False) -> None:
+                 zero_balance: bool = False, code: str = "",
+                 signal: str = "", severity: str = "") -> None:
     """把失败写回账号，并按需要进哨兵。**不抛异常**。
 
     ## `zero_balance`：额度类失败要**落一个 0 到余额列**
@@ -817,7 +843,36 @@ def note_failure(db: Session, account: Account | None, *, kind: str,
         if zero_balance:
             # 只降不升：已经记 0 的保持 0，不要把它改回未知（NULL）——
             # NULL 会被选号当成「余额未知，放行」，等于又把空号放回队列。
-            account.balance_remain = 0
+            #
+            # ⚠️ **但「额度类失败」不等于「这个号没额度」**（2026-11-09 实测）：
+            # 一次瞬时的 402（并发打满 / 单模型限额 / 上游限流）就会把
+            # `balance_remain` 永久写成 0，而 `balance_total` 还是 4800。
+            # 于是号池里几十个号全被这一行摘掉，请求直接回
+            # 「所有账号的积分都已用尽」—— 用户看到的正是
+            # 「账号池这么多账号都没额度了吗」。
+            #
+            # ## 判据：`balance_total` 是「上游发过多少配额」
+            #
+            # `apply_quota()` 写的是 `balance_remain = balance_total = available`。
+            # 所以 **`balance_total > 0` 而 `balance_remain == 0` 只可能来自
+            # 这里的清零**，上游同步永远不会产生这个组合。
+            #
+            # 规则因此变成：
+            #   · 有配额痕迹（total > 0）→ **不动余额**（那是事实数据），
+            #     改用**降级窗口**（`degrade_until`）把它挪出候选集；
+            #     窗口到期 + 下次余额同步就能回来，不会永久判死；
+            #   · 没有配额痕迹 → 才降成 0（这个号上游确实没给钱）。
+            granted = int(account.balance_total or 0) > 0
+            current = int(account.balance_remain or 0)
+            if not granted or current <= 0:
+                account.balance_remain = 0
+            else:
+                # 降级窗口是**可恢复**的隔离：冷却到期它会回来，
+                # 但每次 402 都重新续 30 分钟，不会变成「每 10 分钟白撞一次」。
+                until = now + __import__("datetime").timedelta(
+                    seconds=QUOTA_DEGRADE_SECONDS)
+                if account.degrade_until is None or account.degrade_until < until:
+                    account.degrade_until = until
         if cool_seconds > 0:
             until = now + __import__("datetime").timedelta(seconds=cool_seconds)
             if account.cool_until is None or account.cool_until < until:
@@ -834,9 +889,15 @@ def note_failure(db: Session, account: Account | None, *, kind: str,
         from admin import sentinel
 
         if public_platform:
+            # **不要把 HTTP 状态码当业务码传**（以前传的就是 `status`）：
+            # 403 在 WorkBuddy 是「出口被拦」，在别的平台可能只是额度不足，
+            # 混用会让哨兵给出错误的信号名与严重程度。
+            # 平台自己知道真实码就传 `code`；不知道就留空，
+            # 让哨兵按 `kind` 归类（限速/排队/额度/登录失效都有对应 severity）。
             sentinel.note_failure(public_platform, int(account.id or 0), kind,
-                                  code=str(status or ""), status=int(status or 0),
-                                  detail=(detail or "")[:200], model=model or "")
+                                  code=str(code or ""), status=int(status or 0),
+                                  detail=(detail or "")[:200], model=model or "",
+                                  signal=signal or "", severity=severity or "")
     except Exception:  # noqa: BLE001
         logger.debug("哨兵上报失败 kind=%s", kind, exc_info=True)
 
@@ -1212,14 +1273,42 @@ def apply_account_filters(q, model, *, search: str = "", status: str = "",
 
 
 def account_order(q, model, sort: str = "id_desc"):
-    """排序白名单（防注入：直接映射列，不拼字符串）。"""
+    """排序白名单（防注入：直接映射列，不拼字符串）。
+
+    ## 为什么要这么多组合（2026-11-09）
+
+    控制台账号池改成「点表头排序」后，前端只能传 `列_方向` 这一种形状。
+    以前只有 5 个键（`id_asc` / `credits_desc` / `name_asc` / `synced_desc` …），
+    点「名称」升序能排、再点一次想降序就落到白名单外，被**静默忽略**变回
+    `id_desc` —— 用户看到的是「点了没反应/顺序乱跳」。
+
+    所以这里按 `列_asc` / `列_desc` 成对补齐。名称用库里的 `name`，
+    「状态」用 `status`（active < disabled 的字典序，配合方向够用）。
+    """
     order = {
+        # 默认 / 入库顺序
         "id_asc": model.id.asc(),
+        "id_desc": model.id.desc(),
+        # 名称
+        "name_asc": model.name.asc(),
+        "name_desc": model.name.desc(),
+        # 状态（启用/停用）
+        "status_asc": model.status.asc(),
+        "status_desc": model.status.desc(),
+        # 积分（剩余）：`credits` 与 `balance` 都是历史叫法，两个都认
         "credits_desc": model.balance_remain.desc(),
         "credits_asc": model.balance_remain.asc(),
-        "name_asc": model.name.asc(),
+        "balance_desc": model.balance_remain.desc(),
+        "balance_asc": model.balance_remain.asc(),
+        # 入库时间
+        "created_desc": model.created_at.desc(),
+        "created_asc": model.created_at.asc(),
+        # 最近同步 / 最近使用
         "synced_desc": model.last_sync_at.desc(),
-    }.get(sort)
+        "synced_asc": model.last_sync_at.asc(),
+        "used_desc": model.last_used_at.desc(),
+        "used_asc": model.last_used_at.asc(),
+    }.get(str(sort or "").strip().lower())
     return q.order_by(order) if order is not None else q.order_by(model.id.desc())
 
 

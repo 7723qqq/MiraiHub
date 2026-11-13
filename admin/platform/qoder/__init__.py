@@ -85,6 +85,10 @@ def install() -> None:
             notes="Qoder %s（%s）。COSY 自签名鉴权；模型格式为 OpenAI，"
                   "支持 Chat Completions / Responses / Anthropic Messages 互转。"
                   % (conf_label, "qoder.com.cn" if realm == "cn" else "qoder.sh"),
+            rating={
+                "tier": "bad",
+                "reason": "需要排队，额度不多，而且巨慢。",
+            },
             extra={
             "task_runners": list(_task_runners().keys()),
             # Qoder 的凭证加密在原生层：扫描能定位账号但读不出 token，
@@ -95,7 +99,15 @@ def install() -> None:
             # （auth.v1.dat），本地导入必然 400「需要 pat 或 credential」。
             # 导入入口统一走 begin-auth（设备授权），避免用户点到死按钮。
             "actions": ["scan", "refresh-quota", "checkin",
-                        "usage", "begin-auth"],
+                        "usage", "begin-auth",
+                        # 号池搬运（issue #25）：`export` / `import-file` 是
+                        # **文件级**备份还原，与上面被去掉的 `import`
+                        # （从客户端扫出凭证，必然 400）不是一回事。
+                        #   export      → GET  /api/qoder/export
+                        #                         （脱敏 / 完整两档 JSONL）
+                        #   import-file → POST /api/qoder/import-batch
+                        #                         （同格式还原，换机器搬号池）
+                        "export", "import-file"],
         },
         ))
         logger.debug("Qoder 平台已登记：%s", platform_id)
