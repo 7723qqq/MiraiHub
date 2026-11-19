@@ -1,6 +1,15 @@
 services:
   admin:
     build: .
+    # 把 `.env` 里的自定义变量带进容器（上游 UA、超时、限流等）。
+    # ⚠️ `required: false` 不能省：`.env` 是被 gitignore 的**本地文件**，
+    # 全新克隆的仓库里没有它。写成必填（`env_file: [.env]`）会让
+    # `docker compose up` 直接以「env file not found」失败，而本文件下方
+    # 的 `${VAR:-default}` 插值本来也不依赖它存在。
+    # 需要 `required` 关键字：Docker Compose ≥ 2.24。
+    env_file:
+      - path: .env
+        required: false
     ports:
       - "${ADMIN_PORT:-8790}:8790"
     volumes:
@@ -11,6 +20,7 @@ services:
       ADMIN_DATABASE_URL: sqlite:////data/workbuddy.db
       ADMIN_REDIS_URL: ""
       ADMIN_GATEWAY_LIMIT_BACKEND: memory
+      ADMIN_POOL_RETRY_WINDOW: "60"
       ADMIN_LOG_REQUEST_PAYLOAD: ${ADMIN_LOG_REQUEST_PAYLOAD:-0}
       ADMIN_LOG_PAYLOAD_MAX_MB: ${ADMIN_LOG_PAYLOAD_MAX_MB:-8}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}

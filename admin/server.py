@@ -18,6 +18,7 @@ from admin.models import SystemSetting
 from admin import env_guard, session_store
 from admin.routers import (accounts, credits, groups,
                            growth, keys, login as login_router, logs, models,
+                           model_market_key as model_market_key_router,
                            proxy, proxies, schedules, sessions as sessions_router,
                            stats, sync)
 from admin.ratelimit import (client_ip_from_request, clear_failures,
@@ -33,6 +34,7 @@ from admin.gateway_limits import GatewayAdmissionMiddleware
 from admin.ip_access import IPBlockMiddleware
 from admin.routers import join_invites
 join_invites_router = join_invites.router
+from admin.public_auth import router as public_auth_router
 from admin.routers import releases
 from admin.routers import audio
 from admin.routers import images
@@ -165,7 +167,7 @@ app.add_middleware(
 async def _join_gate_middleware(request: Request, call_next):
     """join 入口的统一门禁：没有有效访问 Cookie 一律 404。
 
-    覆盖 `/join` 与全部 `/api/join/*`，但**排除**三类：
+    覆盖 `/join`、全部 `/api/join/*` 与聚合入口 `/api/open/*`，但**排除**三类：
       * `/api/join/ticket/exchange` —— 它就是来换 Cookie 的；
       * `/api/join/gate/*`         —— 后台总闸，自己要求管理员鉴权；
       * `/api/join/invites*`       —— 后台邀请码管理，同上。
@@ -174,11 +176,13 @@ async def _join_gate_middleware(request: Request, call_next):
     """
     path = request.url.path
     is_join = (path in ("/join", "/join/", "/static/join.html")
-               or path.startswith("/api/join/"))
+               or path.startswith("/api/join/")
+               or path.startswith("/api/open/"))
     if is_join and not (
         path == "/api/join/ticket/exchange"
         or path.startswith("/api/join/gate/")
         or path.startswith("/api/join/invites")
+        or path.startswith("/api/open/admin/")
     ):
         try:
             from admin import join_gate as _jg
@@ -279,6 +283,19 @@ async def _flush_ip_activity():
 
 @app.on_event("startup")
 async def _start_upstream_connections():
+    # 让「默认 HTTPS 上下文」复用共享信任库，并在后台线程里预建它。
+    #
+    # 不做的话：`http.client` 的每条新连接都会 `create_default_context()`，
+    # 在 Windows 上等于**重扫一遍系统证书库**（实测单次 3~13 秒），
+    # 而平台客户端（marvis / qoder / trae …）用的是同步 `urllib`，
+    # 这一步就发生在一单 worker 的事件循环线程上 —— 2026-11-16 的
+    # 「全站无响应」现场：栈停在 `ssl._load_windows_store_certs` 与 `ssl.read`。
+    try:
+        from admin import upstream_http
+        upstream_http.install_ssl_defaults()
+        upstream_http.warm_ssl_context()
+    except Exception:  # noqa: BLE001 - 预热失败不影响启动（只是首连慢）
+        logger.exception("SSL 上下文准备失败（不影响启动）")
     # Own the embedded runtime's pool; recreate it after a service restart.
     if os.getenv("WORKBUDDY_ANDROID") == "1":
         from admin import upstream_http
@@ -287,6 +304,37 @@ async def _start_upstream_connections():
     # `_startup` 之前，此刻 init_db 还没跑，首次启动（尤其是全新安装的 APK）
     # 必然撞上 `no such table: system_settings`，覆盖值要等到下次重启才生效。
     # 套用动作已挪到 `_startup` 里 init_db 之后，见 `_apply_runtime_overrides`。
+
+
+@app.on_event("startup")
+async def _tune_blocking_executor():
+    """放大默认线程池 —— 平台网关的同步上游调用全靠它。
+
+    `asyncio.to_thread` / `loop.run_in_executor(None, …)` 走默认执行器，默认
+    `max_workers = min(32, cpu+4)`（4 核机器只有 8）。而**流式转发会长期占用
+    线程**：每块数据都要在 worker 里阻塞 `resp.read()` 等上游吐字，SSE 可以等
+    几百秒。8 条并发流就能把默认池占满，此后鉴权 / 选号 / 记账 / IP 落库全部
+    排队 —— 事件循环是活的，但什么也推进不了，从外面看仍是「服务卡住」。
+
+    放大到 64（可用 `ADMIN_BLOCKING_THREADS` 覆盖）：正常并发规模下两边的活
+    不会再互相饿死。
+    """
+    try:
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+
+        raw = (os.getenv("ADMIN_BLOCKING_THREADS", "") or "").strip()
+        try:
+            workers = int(raw) if raw else 64
+        except ValueError:
+            workers = 64
+        workers = max(16, min(256, workers))
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=workers,
+                               thread_name_prefix="wb-blocking"))
+        logger.info("默认线程池 %d 线程（同步上游调用不再互相排队）", workers)
+    except Exception:  # noqa: BLE001 - 调不动就不调，不能影响启动
+        logger.exception("默认线程池调整失败（不影响启动）")
 
 
 @app.on_event("shutdown")
@@ -337,6 +385,8 @@ app.include_router(schedules.router)
 app.include_router(logs.router)
 app.include_router(groups.router)
 app.include_router(stats.router)
+# 给 API Key 用的模型广场（/v1/model-market）：只返回该 Key 能用的模型
+app.include_router(model_market_key_router.router)
 app.include_router(credits.router)
 # 登录设备管理（多设备在线 + 踢下线 + 拉黑）
 app.include_router(sessions_router.router)
@@ -424,6 +474,11 @@ try:
     app.include_router(wps_lingxi_accounts_router.router)
 except Exception:  # noqa: BLE001 - wps_lingxi 目录被裁剪时降级为不挂载
     logger.exception("WPS 灵犀管理接口挂载失败（其它功能不受影响）")
+try:
+    from admin.platform.marvis.routers import accounts as marvis_accounts_router
+    app.include_router(marvis_accounts_router.router)
+except Exception:  # noqa: BLE001 - marvis 目录被裁剪时降级为不挂载
+    logger.exception("腾讯 Marvis 管理接口挂载失败（其它功能不受影响）")
 if os.getenv("WORKBUDDY_ANDROID") != "1" and not env_guard.IS_PROD:
     # 逆向产物管理（任意目录创建 + 递归读取）：**生产不挂载**。
     # 中间件还有一道 404，双保险 —— 见 env_guard.PROD_BLOCKED_PREFIXES。
@@ -433,8 +488,9 @@ app.include_router(login_router.router)
 app.include_router(releases.router)
 # 自助上传页（无需后台登录态）：复刻 WorkBuddy 手机号登录页，
 # 让「发给朋友」这一诉求成立 —— 对方不需要知道后台口令。
-app.include_router(login_router.public_router)
 app.include_router(join_invites_router)
+# 多平台公开注册入口（/api/open/*）：与 /join 同一把总闸，默认关闭
+app.include_router(public_auth_router)
 # join 总闸：状态 / 开关 / 签发访问链接 + 公开的票据兑换端点。
 from admin.routers import join_gate as join_gate_api
 app.include_router(join_gate_api.router)

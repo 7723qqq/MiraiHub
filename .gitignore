@@ -1,4 +1,4 @@
-# ===== 依赖（不要上传） =====
+﻿# ===== 依赖（不要上传） =====
 .venv/
 venv/
 env/
@@ -124,6 +124,7 @@ android-signing/
 workbuddy_admin.db
 workbuddy_admin.db-shm
 workbuddy_admin.db-wal
+data/
 
 # Local credentials file
 登录密码.txt
@@ -163,7 +164,7 @@ admin/data/agent_assets/
 tmp/
 
 # ===== 旧项目产物（换名后不再上传，避免干扰）=====
-docs/
+docs/**
 # 测试目录整体不入库（历史约定：本地私有的探针/样本太多）。
 # 但**锁真实 bug 的回归用例必须入库**，否则改动静默把它吞掉时毫无知觉。
 tests/
@@ -171,6 +172,8 @@ tests/
 tests/*
 !tests/test_android_signing.py
 !tests/test_anthropic_tool_result_image.py
+!tests/test_marvis_content_fingerprint.py
+!tests/test_raccoon_quota_classification.py
 !tests/test_platform_rating.py
 scripts/build_trae_catalog.py
 scripts/build_trae_icube.py
@@ -191,3 +194,106 @@ _backup_*/
 _testenv/
 # 运行时生成的主机标识（与机器绑定，不应入库；用 QODER_MACHINE_ID 显式指定）
 admin/data/qoder_machine_id*
+
+# ===== 本地凭证备份 / 导入报告（含真实账号 token 与手机号，禁止提交）=====
+creds_backup/
+reports/
+zipout/
+ext/
+uc_index.js
+uc_del.js
+urls.txt
+asar_list.txt
+asar_tool.mjs
+asar_extract_prefix.mjs
+ctx.mjs
+ctx2.py
+find_chunks.py
+find_paths.py
+last_refresh_out.json
+search_uc.py
+submit_ticket.py
+wb_credkill.py
+wb_probe_account_revoke.py
+wb_purge_local.ps1
+wb_revoke_semantics.py
+wb_rt_ledger.py
+wb_rt_probe.py
+PERFORMANCE_OPTIMIZATION_PLAN.md
+REPORT_workbuddy_cred_revoke.md
+TICKET_workbuddy_logout_p0.md
+# ===== 发版公告：只让规范命名的 release notes 进库（docs/ 整体忽略）=====
+!docs/RELEASE_NOTES_1.1.3.md
+# ===== 本轮新增的回归用例（锁真 bug，必须入库）=====
+!tests/test_marvis_token_ttl.py
+!tests/test_key_model_market.py
+!tests/test_marvis_platform.py
+!tests/test_marvis_model_naming.py
+!tests/test_keepalive_frames.py
+!tests/test_billing_slot_names.py
+!tests/test_marvis_auth_ux.py
+!tests/test_dispatch_generic_models.py
+!docs/RELEASE_NOTES_1.1.4.md
+!tests/test_marvis_oauth_exchange.py
+!tests/test_marvis_no_redirect.py
+!tests/test_marvis_input_cleared.py
+
+# ===== Marvis uskey 免客户端方案（2026-11-18）=====
+# 上下文：beacon_wrapper.dll / qimei.dll 进仓库（否则克隆下来签不出 uskey，
+# 网关只能降级随机填充，上游必回 4100404）。两个 DLL 合计约 4.6 MB。
+!vendor/beacon/*.dll
+# 签名缓存是运行时产物，每台机器不同，不入库
+vendor/beacon/uskey_cache.json
+vendor/beacon/uskey_cache.json.bak
+vendor/beacon/_backup/
+
+# 逆向过程产物：抓包、内存镜像、反汇编清单，体积大且不可复现，不入库
+*.mitm
+*.pcap
+*.raw
+uskey_callgraph*.json
+
+# gateway 的历代手工备份（改代码前的快照，不入库）
+admin/platform/marvis/gateway.py.bak-*
+
+# tools/ 目录：只放行与「跑起来」直接相关的脚本，
+# 逆向分析脚本（probe_* / hook_* / find_* / disasm_* 等）留在本地。
+tools/*
+!tools/uskey_sign_service.py
+!tools/sync_vendor_dll.py
+!tools/set_safe_context_limits.py
+!tools/inspect_model_configs.py
+!tools/deploy_check.sh
+!tools/ctl.sh
+!tools/install_systemd.sh
+!tools/status.sh
+!tools/deploy_ctx_retry.sh
+!tools/deploy_safe_limits.sh
+
+# 这两份文档说明「怎么部署」「算法为什么没破」，属于交付物，放行
+!docs/uskey-wine-deploy.md
+!docs/uskey-reverse-report.md
+
+# ===== 生产环境运维脚本：含服务器路径 / 服务名，不入公开仓库 =====
+# 这些脚本是为特定部署环境写的（GW=/www/wwwroot/workbuddy2api、
+# systemctl -u workbuddy2api），换一台机器就失效，属于环境特定物。
+# 留在本地即可；仓库只保留与机器无关的 uskey_sign_service.py 和
+# sync_vendor_dll.py。
+tools/ctl.sh
+tools/status.sh
+tools/deploy_check.sh
+tools/deploy_ctx_retry.sh
+tools/deploy_ctx_overflow.sh
+tools/deploy_safe_limits.sh
+tools/deploy_gateway.sh
+tools/install_systemd.sh
+tools/final_verify.sh
+tools/acceptance.sh
+tools/check_online_health.sh
+tools/verify_gateway.sh
+tools/test_upstream.sh
+tools/inspect_model_configs.py
+tools/set_safe_context_limits.py
+
+# 服务器地址一律不进仓库
+112.124.*

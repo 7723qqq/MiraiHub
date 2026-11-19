@@ -70,6 +70,15 @@ _GENERIC_MODEL_NAMES = frozenset({
     "auto", "default", "chat", "best", "smart", "fast", "router", "auto-model",
 })
 
+#: **已整体下线**的平台 → 模型名前缀。
+#:
+#: 用途只有一个：认出「客户端配置里还留着的旧模型名」，直接回 404 讲清楚，
+#: 绝不让它落到默认平台去打真上游（见 `_retired_platform_of`）。
+#: 豆包网关 2026-11-15 删除；以后删平台在这里补一行即可。
+RETIRED_PLATFORM_PREFIXES = {
+    "doubao-": "doubao",
+}
+
 #: 平台顺序缓存（秒）。热路径每次请求都算一遍健康度太贵。
 _ORDER_TTL = 3.0
 _order_cache: dict = {"at": 0.0, "value": None, "signature": ""}
@@ -155,7 +164,11 @@ def resolve(request: Request) -> tuple[str, str]:
         if picked:
             return picked[0], picked[1]
 
-    if _spread_unbound():
+    # 通用路由名（`auto` 等）不走「无头分摊」：它没有模型归属，
+    # 分摊到哪个平台就等于让那个平台自己解释 `auto` —— 有的平台认、
+    # 有的平台直接 404。这类请求固定落默认平台，由主应用的自动选模型
+    # 接住，行为才可预期（issue #38）。
+    if _spread_unbound() and not (model and model.strip().lower() in _GENERIC_MODEL_NAMES):
         picked = _strategy_pick()
         if picked and not _is_disabled(picked[0], disabled):
             return picked
@@ -206,6 +219,69 @@ def _is_disabled(platform_id: str, disabled: set[str]) -> bool:
     spec = registry.get(pid)
     storage = str(getattr(spec, "storage", lambda: "")() or "").lower() if spec else ""
     return bool(storage) and storage in disabled
+
+
+def _storage_of(platform_id: str) -> str:
+    """平台 id -> 落库平台（`trae-cn` -> `trae`，`workbuddy` -> `workbuddy`）。
+
+    判断「这是不是同一个平台」必须比落库平台：`trae-cn` 与 `trae-intl` 是
+    两个对外 id、一份账号池，拿 id 比会把「绑了 trae 的 Key」误判成不匹配。
+    """
+    spec = registry.get(str(platform_id or "").lower())
+    if spec is not None:
+        return str(spec.storage()).lower()
+    return str(platform_id or "").strip().lower()
+
+
+class _KeyView:
+    """判「改道可行性」用的 Key 视图：**去掉独占平台约束**，其余照旧。
+
+    ## 为什么要脱掉 platform
+
+    `scope_accounts` 在 Key 绑了平台时会再加一条 `Account.platform = 该平台`，
+    于是「判断 loomy 能不能服务这个模型」永远得到 False —— 改道判断就此失去
+    意义，Key 绑了 workbuddy 就连 loomy 专属模型也调不动了（线上在用）。
+
+    `account_id` / `account_ids` **保留**：独占账号是用户对「用哪些号」的
+    硬约束，改道也不能借用别的号。
+    """
+
+    __slots__ = ("id", "account_id", "account_ids", "platform", "group_id", "aggregate")
+
+    def __init__(self, key):
+        self.id = int(getattr(key, "id", 0) or 0)
+        self.account_id = getattr(key, "account_id", None)
+        self.account_ids = getattr(key, "account_ids", "") or ""
+        self.platform = ""
+        self.group_id = int(getattr(key, "group_id", 0) or 0)
+        self.aggregate = bool(getattr(key, "aggregate", True))
+
+
+class _ReroutedKey:
+    """改道**执行**时的 Key 视图：只脱掉 `platform`，其余属性全部委托。
+
+    ## 为什么只有判可行还不够
+
+    `_KeyView` 只影响改道前的候选判断。改道确认后，请求由**目标平台网关**
+    执行，而网关选号（`shared.select_account` -> `scope_accounts`）拿的是
+    **真实 Key**：Key 绑了 workbuddy，就再加一条 `Account.platform='workbuddy'`，
+    与目标平台的 `Account.platform='loomy'` 交集为空 —— 必然选不到号，
+    改道 100% 落成 503「没有可用账号」。
+
+    改道本身就是「用户想要的平台做不了这个模型」的兜底，平台绑定约束在
+    改道场景下必须豁免；**独占账号 / 分组 / 额度 / 状态照旧**，网关里其余
+    读 Key 的地方（配额、日志归属、trae 的 realm 推断）拿到的值不变。
+    """
+
+    __slots__ = ("_key", "platform")
+
+    def __init__(self, key):
+        self._key = key
+        self.platform = ""
+
+    def __getattr__(self, name):
+        # 只在 `_key` 上缺属性时才走到这里（platform 在 __slots__ 里）。
+        return getattr(self._key, name)
 
 
 def _aggregate_enabled(key) -> bool:
@@ -417,6 +493,7 @@ def _model_catalog(db) -> list[dict]:
         return _model_cache["rows"]
     from admin.model_alias import canonical_key, model_display
     from admin.models import ModelConfig
+    from admin.platform import models_router as _mr
 
     raw = (db.query(ModelConfig.platform, ModelConfig.model_id,
                     ModelConfig.credit_multiplier, ModelConfig.upstream_metadata)
@@ -430,11 +507,22 @@ def _model_catalog(db) -> list[dict]:
         if not storage or not model_id:
             continue
         display = model_display(metadata)
+        # **归一 key 用「可读名」算**（2026-11-15）：
+        # 腾讯 Marvis 的 model_configs 里存的是上游槽位名（`main-auto`），
+        # 它的归一 key 是 `mainauto` —— 与客户端发的 `deepseek-v4.1-flash`
+        # （key `deepseekv41flash`）永远对不上，于是 dispatch 认为
+        # 「Marvis 没有这个模型」，直接回
+        # 「模型不属于平台 marvis（该模型在：workbuddy、loomy…）」。
+        # 用 `readable_model_id()` 把槽位换成真实模型名后再算 key，
+        # 聚合视图与自动选路才认得它；转发时仍用原始 model_id（上游只认槽位）。
+        readable = _mr.readable_model_id(storage, model_id)
+        key = canonical_key(readable or model_id, display)
         entry = {
             "platform": storage,
             "model_id": model_id,
+            "readable": readable,
             "display": display,
-            "key": canonical_key(model_id, display),
+            "key": key,
             "multiplier": multiplier,
         }
         rows.append(entry)
@@ -516,6 +604,24 @@ def _model_platforms(db, model: str) -> list[tuple[str, str]]:
     return [key for key, _ in sorted(hits.items(), key=lambda kv: (kv[1], kv[0]))]
 
 
+def _retired_platform_of(model: str) -> str:
+    """模型名指向一个**已整体下线**的平台时，返回那个平台 id。
+
+    2026-11-15 豆包网关整体删除后，客户端配置里还留着
+    `doubao-office-xxx` / `xxx-doubao` 这类名字。它们既不在任何平台
+    模型清单里、也不在主应用白名单里 —— 如果不拦，请求会落到默认平台
+    （WorkBuddy），拿一个不认识的模型去打真上游：表现是长时间挂起或
+    上游报错，还白占默认平台的账号额度。
+    """
+    name = str(model or "").strip().lower()
+    if not name:
+        return ""
+    for prefix, platform in RETIRED_PLATFORM_PREFIXES.items():
+        if name.startswith(prefix) or name.endswith("-" + platform):
+            return platform
+    return ""
+
+
 def _model_id_for(db, storage: str, model: str) -> str:
     """把请求里的模型名映射成**目标平台自己的 model_id**。
 
@@ -561,9 +667,59 @@ def _model_id_for(db, storage: str, model: str) -> str:
                 exact = row["model_id"]
                 break
 
+    # 4) **平台自己的归一钩子**（2026-11-15）。
+    #    有些平台的上游 id 与对外名完全不同（Marvis：槽位 `main-auto` ↔
+    #    真实 `deepseek-v4-1-flash-261017` ↔ 可读 `deepseek-v4.1-flash`），
+    #    `model_configs` 只存槽位名，按 id/key 都查不到另外两种写法。
+    #    平台若在自己模块里提供了 `canonical_model_id()`，就交它兜底 ——
+    #    这样新增平台不必改 dispatch。
+    if not exact:
+        normalized = _platform_canonical(storage, model)
+        if normalized and normalized != model:
+            exact = normalized
+
+    # 5) **槽位名 → 可读名**（2026-11-15 向后兼容）。
+    #
+    # Marvis 早期对外发的是槽位名（`main-auto`），不少客户端配置里留的就是它；
+    # 后来目录改成可读名后 `model_configs` 只存 `deepseek-v4.1-flash`，
+    # 槽位名就查不到了 —— 老配置会突然全 404。
+    #
+    # 这里按平台的「槽位 → 可读名」映射反查一次：映射结果确实是该平台的原生
+    # id 才改（`readable_model_id` 对别的平台是恒等，不会误伤）。
+    if not exact:
+        try:
+            from admin.platform import models_router as _mr
+
+            readable = _mr.readable_model_id(storage, model)
+            if readable and readable != model and _mr.is_native_model_id(storage, readable):
+                exact = readable
+        except Exception:  # noqa: BLE001 - 兜底失败就按原样
+            pass
+
     if not exact:
         return model
     return exact.split(":", 1)[0] if storage == "trae" else exact
+
+
+def _platform_canonical(storage: str, model: str) -> str:
+    """问平台「这个名字对应你的哪个上游 id」（没有钩子就返回空串）。
+
+    约定：平台包可提供 `core.endpoints.canonical_model_id(str) -> str`。
+    异常一律吞掉 —— 兜底逻辑坏掉不能影响正常转发。
+    """
+    storage = str(storage or "").lower()
+    if not storage or not model:
+        return ""
+    try:
+        mod = __import__("admin.platform.%s.core.endpoints" % storage,
+                         fromlist=["canonical_model_id"])
+        fn = getattr(mod, "canonical_model_id", None)
+        if callable(fn):
+            value = str(fn(model) or "")
+            return value if value and value != model else ""
+    except Exception:  # noqa: BLE001 - 平台没有这个钩子 / 导入失败
+        return ""
+    return ""
 
 
 def _disabled_model_id(db, storage: str, model: str) -> str:
@@ -635,6 +791,12 @@ def _model_for_platform(db, storage: str, model: str) -> tuple[str, dict | None]
     # 这种 id 的归一 key 可能是展示名算出来的（dfmodel -> deepseekv41flash），
     # 单看 key 会误判成「不属于该平台」，把本来正确的调用打成 404。
     if any(row["model_id"] == model for row in (by_storage.get(storage) or [])):
+        return model, None
+    # **可读名也是原生 id**（2026-11-15）：Marvis 的 model_configs 存槽位名
+    # （`main-auto`），但 `/v1/models` 对外发的是可读名（`deepseek-v4.1-flash`）。
+    # 客户端拿着可读名回来时必须按同平台命中，否则会被判成「属于别的平台」。
+    if any(str(row.get("readable") or "").lower() == str(model or "").strip().lower()
+           for row in (by_storage.get(storage) or [])):
         return model, None
     owners: list[str] = []
     for row in by_key.get(alias) or []:
@@ -779,7 +941,109 @@ def _platform_paused(platform: str) -> bool:
         return False
 
 
+def _storage_has_model(db, storage: str, model: str) -> bool:
+    """该落库平台的**已启用**清单里有没有这个模型（认原生 id 与归一 key）。"""
+    from admin.model_alias import canonical_key, model_display
+    from admin.models import ModelConfig
+
+    text = str(model or "").strip().lower()
+    if not text:
+        return False
+    alias = canonical_key(text)
+    rows = (db.query(ModelConfig.model_id, ModelConfig.upstream_metadata)
+            .filter(ModelConfig.platform == storage,
+                    ModelConfig.enabled == 1).all())
+    for model_id, metadata in rows:
+        mid = str(model_id or "")
+        if mid.lower() == text:
+            return True
+        if alias and canonical_key(mid, model_display(metadata)) == alias:
+            return True
+    return False
+
+
+def _reroute_target(db, model: str, key, disabled: set[str] | None = None) -> tuple[str, str, str] | None:
+    """模型不属于「用户想要的平台」时，返回该改道到的 `(平台id, realm, 依据)`。
+
+    返回 `None` = **不该改道**，保持当前选路结果（默认平台 / Key 绑定平台）。
+
+    ## 为什么不是「查归属，查到就改道」（旧实现，线上事故）
+
+    `platform_of_model()` **只取第一条**同名 `model_configs`：
+    `deepseek-v4.1-flash` 在 trae(id=9) / workbuddy(57) / loomy(72) 都登记了，
+    第一条是 trae，于是每条请求都被它抢去 trae —— Key 绑定的平台、显式
+    `X-Platform`、平台禁用开关全部形同虚设（实测独占 workbuddy 的 Key
+    两天内 trae 785 次 / workbuddy 52 次）。
+
+    现在的判定顺序：
+
+        1. 想要的平台（Key 绑定平台，否则默认平台）在这个模型的候选里
+           -> 不改道（候选 = 有号 + 未冷却 + 健康）；
+        2. 不在候选里、但有别的平台能做 -> 改道到该平台；
+        3. 归一 key 匹配不上（如 raccoon 的 `sn-xxx-1017` 展示名与 id 不同）
+           -> 退回按归属反查，**但仍然只在想要的平台根本没有这个模型时**才改道。
+
+    禁用与网关实现由调用方/本函数最后一道 `_spec_with_gateway` 保证。
+    """
+    text = str(model or "").strip()
+    if not text:
+        return None
+    # **通用路由名没有「归属平台」**（2026-11-16，issue #38）。
+    # `auto` / `default` / `chat` 这类名字是「让网关自己挑模型」，
+    # 每个平台都可以各自实现，`model_configs` 里谁登记了它纯属偶然。
+    # 旧逻辑按 `platform_of_model()` 做归属反查，于是 `auto` 被抢到唯一
+    # 登记了 auto 行的平台（线上是 Qoder），而上游并不认这个词 —— 表现
+    # 就是「开聚合 + 用 auto → 恒 HTTP 404」，且用户完全看不出落在哪。
+    if text.lower() in _GENERIC_MODEL_NAMES:
+        return None
+    bound = str(getattr(key, "platform", "") or "").strip() if key is not None else ""
+    want = _storage_of(bound or registry.DEFAULT_PLATFORM)
+    disabled = disabled or set()
+
+    candidates = _candidates_for_model(db, text, _KeyView(key) if key is not None else None)
+    if candidates:
+        if any(_storage_of(pid) == want for pid, _realm, _mapped in candidates):
+            return None
+        for pid, realm, _mapped in candidates:
+            if _is_disabled(pid, disabled):
+                continue
+            spec = _spec_with_gateway(pid, realm)
+            if spec is None:
+                continue
+            try:
+                if getattr(_module_of(spec), "dispatch", None) is None:
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            return str(getattr(spec, "id", "") or pid), realm, "候选里没有想要的平台"
+        return None
+
+    # 归一 key 对不上：先确认想要的平台确实没有这个模型，再按归属反查。
+    if _storage_has_model(db, want, text):
+        return None
+    from admin.platform import models_router
+
+    owner = models_router.platform_of_model(text, db)
+    if not owner or _storage_of(owner) == want:
+        return None
+    if _is_disabled(owner, disabled):
+        return None
+    spec = _spec_with_gateway(owner, "")
+    if spec is None:
+        return None
+    try:
+        if getattr(_module_of(spec), "dispatch", None) is None:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    return str(getattr(spec, "id", "") or owner), str(getattr(spec, "realm", "") or ""), "归属反查"
+
+
 def _platform_for_model(model: str, key) -> tuple[str, str, str] | None:
+    # 通用路由名不参与「按模型选平台」：`auto` 落在谁身上都该由那个平台
+    # 自己解释（默认平台由主应用的自动选模型接住）。见 `_reroute_target`。
+    if str(model or "").strip().lower() in _GENERIC_MODEL_NAMES:
+        return None
     try:
         with _db() as db:
             candidates = _candidates_for_model(db, model, key)
@@ -1239,34 +1503,51 @@ class PlatformDispatchMiddleware:
         # 这里就把这个耦合切断。
         explicit_platform = bool(suffix_platform)
 
-        # **兜底 1：模型名能还原成某平台的模型时，强制走该平台网关。**
+        # **兜底 1（收敛版）：模型确实不属于「用户想要的平台」时才改道。**
         #
         # 场景：客户端发 `deepseek-flash-qoder`，但后缀解析失败
         # （名字拼错平台、或用了不含后缀的可读名如 `deepseek-flash`），
-        # 于是落到默认平台 → 主应用白名单里没有 → 400。
-        # 这里反查一次：归属明确就改道，不让主应用插手。
-        if not explicit_platform and body:
+        # 于是落到当前平台 → 主应用白名单里没有 → 400。
+        # 这里反查一次：确实做不了才改道，不让主应用插手。
+        #
+        # ## 旧实现为什么让「独占 workbuddy 的 Key」全部打到 trae
+        #
+        # 它用 `platform_of_model()` 判断归属，而那个函数**只取第一条**同名
+        # `model_configs`。`deepseek-v4.1-flash` 在 trae(id=9) / workbuddy(57) /
+        # loomy(72) 都有登记，第一条是 trae —— 于是每条请求都被改道到 trae：
+        # Key 绑定的平台、显式 `X-Platform` 头、平台禁用开关全部被绕过。
+        # 实测：独占 workbuddy 的 Key 两天内 trae 785 次 / workbuddy 52 次；
+        # trae-cn 已在「平台网关」里禁用，却仍在承载全部流量。
+        #
+        # 现在改成和「按模型选路」同一套候选判断（有号 + 健康 + 未暂停），
+        # 并加三道闸门：
+        #   1. 显式 `X-Platform` 头：用户已表态，一个字节都不改；
+        #   2. 用户想要的平台（Key 绑定平台，否则默认平台）**能服务**这个模型
+        #      -> 不动。这就是「绑了 workbuddy 就该走 workbuddy」；
+        #   3. 改道目标必须**没被禁用**且**有网关实现**。
+        if not explicit_platform and body and not _explicit_selector(request):
             try:
-                from admin.platform import models_router as _mr
-
                 _m = _model_of_body(body)
                 if _m:
+                    _dis0 = _disabled_platforms()
                     with _db() as _rdb:
-                        _owner = _mr.platform_of_model(_m, _rdb)
-                    if _owner and _owner != registry.DEFAULT_PLATFORM:
-                        _spec_o = registry.get(_owner)
-                        if _spec_o is not None:
-                            try:
-                                _mod_o = _module_of(_spec_o)
-                                if getattr(_mod_o, "dispatch", None) is not None:
-                                    platform_id = _owner
-                                    explicit_platform = True
-                                    suffix_platform = _owner
-                                    logger.info(
-                                        "dispatch 兜底改道 | model=%r -> platform=%r",
-                                        _m, _owner)
-                            except Exception:  # noqa: BLE001
-                                pass
+                        _target = _reroute_target(_rdb, _m, _key_of(request), _dis0)
+                    if _target is not None:
+                        platform_id, realm = _target[0], _target[1] or realm
+                        explicit_platform = True
+                        suffix_platform = platform_id
+                        # **改道后换掉 scope 里的 Key 缓存**：目标平台网关
+                        # 选号走 `shared.key_row`（读 `_wb_api_key`），换成
+                        # platform 已脱空的 `_ReroutedKey`，否则 `scope_accounts`
+                        # 的 `Account.platform = Key绑定平台` 会把账号池锁回
+                        # 原平台 —— 改道判定成功、执行必然 503。
+                        # 独占账号 / 分组 / 额度全部保留（见 _ReroutedKey）。
+                        _real_key = _key_of(request)
+                        if _real_key is not None and str(
+                                getattr(_real_key, "platform", "") or "").strip():
+                            scope["_wb_api_key"] = _ReroutedKey(_real_key)
+                        logger.info("dispatch 兜底改道 | model=%r -> platform=%r (%s)",
+                                    _m, platform_id, _target[2])
             except Exception:  # noqa: BLE001
                 logger.debug("兜底改道失败", exc_info=True)
         # 默认平台**本身没有独立网关实现**（它就是主应用），
@@ -1293,6 +1574,23 @@ class PlatformDispatchMiddleware:
                     suffix_platform)
 
         if platform_id == registry.DEFAULT_PLATFORM and not explicit_platform:
+            # **已下线平台的模型名：直接 404，不许漏进主应用。**
+            # 没有任何平台认领它、主应用白名单里也没有；漏过去就是拿一个
+            # 不存在的模型打真上游（挂起/报错，还白占默认平台额度）。
+            if body:
+                _retired_model = _model_of_body(body)
+                _retired = _retired_platform_of(_retired_model)
+                if _retired:
+                    logger.info("已下线平台的模型请求被拒 | model=%r platform=%r",
+                                _retired_model, _retired)
+                    return await JSONResponse(
+                        status_code=404,
+                        content={"error": {
+                            "message": "模型 %s 所属的平台（%s）已下线，请改用其它模型"
+                                       % (_retired_model, _retired),
+                            "type": "invalid_request_error",
+                            "code": "model_not_found",
+                        }})(scope, receive, send)
             # 默认平台走主应用。但**聚合名要先映射成它自己的 model_id**：
             # 主应用只认白名单里的 id，`deepseek-flash` 这类聚合名会被
             # 直接 400「模型不存在」。之前只有非默认平台做映射，
@@ -1350,6 +1648,16 @@ class PlatformDispatchMiddleware:
         module = _module_of(spec)
         dispatch = getattr(module, "dispatch", None) if module is not None else None
         if dispatch is None:
+            if _retired_platform_of(str(platform_id) + "-") or str(platform_id) in \
+                    RETIRED_PLATFORM_PREFIXES.values():
+                # 显式点了已下线平台（`X-Platform: doubao`）：给 404 而不是 503，
+                # 免得用户以为是暂时故障、反复重试。
+                return await JSONResponse(
+                    status_code=404,
+                    content={"error": {
+                        "message": "平台 %s 已下线，请改用其它平台" % platform_id,
+                        "type": "invalid_request_error",
+                        "code": "platform_retired"}})(scope, receive, send)
             logger.warning("平台 %s 未装配网关实现，请求被拒绝", platform_id)
             return await JSONResponse(
                 status_code=503,

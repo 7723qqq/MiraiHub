@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -406,7 +407,10 @@ async def _forward(body: dict, request) -> JSONResponse:
                            "code": "empty_messages", "message": str(exc)}},
                 status_code=400)
         try:
-            result, account, started = _attempt(db, request, key, body, realm)
+            # 选号 + 建连 + 读完整响应全程同步：留在事件循环上就是
+            # 2026-11-16 那种「一次上游卡顿，全站停摆」，必须进工作线程。
+            result, account, started = await asyncio.to_thread(
+                _attempt, db, request, key, body, realm)
         except shared.PlatformRejected:
             raise
         except client.UpstreamError as exc:
@@ -638,8 +642,9 @@ async def _forward_stream(body: dict, request):
 
     return StreamingResponse(
         # **空闲心跳**：上游排队/限流/慢思考时整条流可能几十秒无字节，
-        # 每 8 秒一帧 `: ping` 注释（SSE 规范，所有解析器忽略），
-        # 把「链路活着」变成客户端可见的事实。
+        # 每 8 秒一帧**空增量 data 帧**（真实事件，会被解析并重置客户端
+        # idle 计时器；旧注释帧已被证明无效，可用
+        # MIRAIHUB_KEEPALIVE_DATA_FRAME=0 回退）。
         bridge.with_pings(generator(), ping=bridge.CHAT_PING),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
